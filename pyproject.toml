@@ -1,0 +1,238 @@
+[project]
+name = "mistral-text-to-spech"
+version = "0.0.1"
+description = "A Python CLI application"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio.git",
+    "tiktoken>=0.7.0",
+    "sounddevice>=0.4.6",
+    "numpy>=1.26.0",
+    "pyyaml>=6.0",
+    "fastapi>=0.115.0",
+    "pydantic>=2.0.0",
+    "uvicorn>=0.34.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mistral_text_to_spech"]
+
+[project.optional-dependencies]
+dev = [
+    # Testing
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "pytest-randomly>=3.15.0",
+    "pytest-timeout>=2.2.0",
+    "httpx>=0.27.0",  # Required by FastAPI TestClient
+
+    # Linting & Formatting
+    "ruff>=0.1.0",
+
+    # Type Checking
+    "mypy>=1.7.0",
+    "pyright>=1.1.0",
+
+    # Architecture
+    "pytestarch>=4.0.0",
+
+    # Security & Quality
+    "bandit[toml]>=1.7.8",
+    "deptry>=0.20.0",
+    "pygount>=1.6.4",
+    "codespell>=2.3.0",
+    "pip-audit>=2.7.0",
+    "semgrep>=1.144.0",
+
+    # Git Hooks
+    "pre-commit>=3.6.0",
+]
+
+[tool.ruff]
+line-length = 140
+indent-width = 4
+target-version = "py312"
+exclude = [".git", ".ruff_cache", ".venv", ".vscode", "reports"]
+
+[tool.ruff.lint]
+# Core errors & warnings, Google-style docs, types, bugbear, quotes, imports, naming
+# Plus: complexity, modern syntax, performance, simplifications, tidy imports
+select = [
+  "E", "F",   # pycodestyle errors, pyflakes
+  "D",        # pydocstyle (Google-style)
+  "ANN",      # flake8-annotations
+  "B",        # flake8-bugbear
+  "Q",        # flake8-quotes
+  "I",        # isort
+  "N",        # pep8-naming
+  "C90",      # mccabe complexity
+  "UP",       # pyupgrade (modern Python 3.12+ syntax)
+  "PERF",     # perflint (performance anti-patterns)
+  "SIM",      # flake8-simplify
+  "TID",      # flake8-tidy-imports
+]
+ignore = [
+  "D107",    # don't require __init__ docstring (class docstring is fine)
+  "N802",    # allow non-lowercase function names (if needed)
+]
+
+[tool.ruff.lint.mccabe]
+# Flag functions with complexity > 10
+max-complexity = 10
+
+[tool.ruff.lint.flake8-tidy-imports]
+# Ban relative imports for cleaner, more explicit code
+ban-relative-imports = "all"
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["D", "ANN"]
+"stubs/**/*.pyi" = ["D", "ANN"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# pytest-timeout: prevent tests from hanging indefinitely
+timeout = 30
+timeout_method = "thread"
+# pytest-randomly: randomize test order to catch hidden dependencies
+markers = [
+    "architecture: Architecture import rule tests",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+no_implicit_reexport = true
+disable_error_code = ["import-untyped"]
+
+# Limit what mypy considers part of the project
+files = ["src", "tests"]
+
+# CI ergonomics
+show_error_codes = true
+pretty = true
+
+# Exclude virtual environment
+exclude = [".venv/"]
+
+# Third-party libraries without type stubs
+[[tool.mypy.overrides]]
+module = ["sounddevice", "sounddevice.*", "mlx_audio", "mlx_audio.*", "mlx", "mlx.*", "uvicorn", "uvicorn.*"]
+ignore_missing_imports = true
+
+# Tests – still type checked, but not fully strict
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+check_untyped_defs = false
+
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "*/tests/*",
+    "*/test_*.py",
+    "*/__init__.py",
+]
+branch = true
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+    "@abc.abstractmethod",
+]
+
+[tool.coverage.html]
+directory = "reports/coverage/html"
+
+[tool.coverage.xml]
+output = "reports/coverage/coverage.xml"
+
+[tool.bandit]
+targets = ["src"]
+exclude = [
+    "tests",
+    ".venv",
+    "venv",
+]
+# Reasonable default for CI
+severity = "MEDIUM"
+confidence = "MEDIUM"
+
+[tool.deptry]
+# Source scanning - only check src/ directory
+extend_exclude = [
+    "build",
+    "dist",
+    "docs",
+    "scripts",
+    "data",
+    "reports",
+    "notes",
+]
+
+# Ignore Jupyter notebooks (not part of production code)
+ignore_notebooks = true
+
+# First-party modules - tell deptry what belongs to this project
+known_first_party = [
+    "src",
+]
+
+# PEP 621 dev dependency groups - these are NOT runtime dependencies
+pep621_dev_dependency_groups = [
+    "dev",
+]
+
+# Keep all rules enabled (DEP001-DEP005)
+ignore = []
+
+# CI/Reporting integration
+json_output = "reports/deptry/deptry.json"
+
+[tool.deptry.per_rule_ignores]
+DEP002 = [
+    "pytestarch",  # Used in tests/architecture/ only
+    "tiktoken",  # Required by mlx-audio for Voxtral TTS tokenizer
+    "uvicorn",  # Used as CLI server runner, not imported in source
+]
+
+[tool.codespell]
+# Paths to check
+check-filenames = true
+check-hidden = false
+
+# Directories to skip
+skip = ".git,.venv,venv,build,dist,reports,*.lock,uv.lock"
+
+# Use external ignore file for maintainability
+ignore-words = "config/codespell/ignore.txt"
