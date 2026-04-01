@@ -44,6 +44,7 @@ help:
     @echo ""
     @printf "\033[0;33mSetup & Lifecycle:\033[0m\n"
     @printf "  %-40s %s\n" "init" "Initialize the development environment"
+    @printf "  %-40s %s\n" "download" "Download a TTS model (interactive)"
     @printf "  %-40s %s\n" "destroy" "Destroy the virtual environment"
     @printf "  %-40s %s\n" "check" "Check prerequisites"
     @printf "  %-40s %s\n" "help" "Show this help message"
@@ -103,7 +104,25 @@ init: check
     @mkdir -p reports/deptry
     @echo "Installing Python dependencies..."
     @uv sync --all-extras
+    @if ! ls data/models/*/model.safetensors >/dev/null 2>&1; then \
+        if [ -t 0 ]; then \
+            printf "\033[0;33m⚠ No TTS model found. Starting download...\033[0m\n"; \
+            echo ""; \
+            bash scripts/download-model.sh; \
+        else \
+            printf "\033[0;33m⚠ No TTS model found. Run 'just download' to fetch one.\033[0m\n"; \
+        fi; \
+    fi
     @printf "\033[0;32m✓ Development environment ready\033[0m\n"
+    @echo ""
+
+# Download a TTS model (interactive)
+download:
+    @echo ""
+    @printf "\033[0;34m=== Downloading TTS Model ===\033[0m\n"
+    @bash scripts/download-model.sh
+    @echo ""
+    @printf "\033[0;32m✓ Model download completed\033[0m\n"
     @echo ""
 
 # Destroy the virtual environment
