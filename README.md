@@ -68,7 +68,7 @@ Creates report directories and installs all dependencies via `uv sync --all-extr
 ### Download a Model
 
 ```bash
-./scripts/download-model.sh
+just download
 ```
 
 Presents three Voxtral 4B variants to choose from:
@@ -83,8 +83,8 @@ After downloading, update `config.yaml` with the model path.
 
 ### Getting Started
 
-1. Run `just init` — installs dependencies
-2. Run `./scripts/download-model.sh` — downloads a Voxtral model
+1. Run `just init` — installs dependencies and prompts to download a model if none exists
+2. Run `just download` — downloads a Voxtral model (if not already triggered by init)
 3. Create `config.yaml` with the model path and server settings (see Configuration below)
 4. Run `just serve` — starts the TTS server
 5. Send requests via the API, CLI, or MCP bridge
@@ -98,6 +98,7 @@ model: /path/to/Voxtral-4B-TTS-2603-mlx-6bit
 models_dir: /path/to/models
 sample_rate: 24000
 default_voice: casual_female
+save_wav: true
 simplify_punctuation: false
 host: 0.0.0.0
 port: 12000
@@ -109,6 +110,7 @@ port: 12000
 | `models_dir` | Base directory containing model subdirectories (for CLI model selection) |
 | `sample_rate` | Audio sample rate in Hz (24000 for Voxtral) |
 | `default_voice` | Default voice for server requests without a voice override |
+| `save_wav` | Save generated audio to WAV files in `data/output/` (`true` or `false`) |
 | `simplify_punctuation` | Strip commas, replace other marks with periods for cleaner speech |
 | `host` | Server listen address |
 | `port` | Server listen port |
@@ -239,6 +241,10 @@ The CI pipeline runs in order: init, code-format, code-style, code-typecheck, co
 ## AI-Assisted Development
 
 This project includes a [CLAUDE.md](CLAUDE.md) file with development rules for AI coding assistants.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for a full list of changes.
 
 ## Resources
 
