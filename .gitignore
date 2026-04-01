@@ -1,0 +1,93 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.log
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# Ruff
+.ruff_cache/
+
+# Reports
+reports/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Copier answers file
+.copier-answers.yml
+
+# UV lock file (can be added to git if desired)
+# uv.lock
+
+# Data subdirectories (keep data/ via .gitkeep)
+data/input/
+data/output/
+data/models/
+
+# Claude Code
+.claude/
+
+# Beads issue tracker
+.beads/
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
+
+# MCP server (Node.js)
+mcp/node_modules/
+
+# Documentation (generated blog posts, drafts)
+docs/
+
+# Documentation (generated blog posts, drafts)
+docs/
