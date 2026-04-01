@@ -2,6 +2,7 @@ model: ./data/models/Voxtral-4B-TTS-2603-mlx-6bit
 models_dir: ./data/models
 sample_rate: 24000
 default_voice: casual_female
+save_wav: true
 simplify_punctuation: false
 host: 0.0.0.0
 port: 12000

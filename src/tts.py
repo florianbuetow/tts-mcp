@@ -231,27 +231,28 @@ def generate_chunks(model: TTSModel, text: str, voice: str) -> list[np.ndarray]:
     return [np.array(result.audio, dtype=np.float32) for result in model.generate(text=text, voice=voice)]
 
 
-def play_chunks(chunks: list[np.ndarray], output_path: Path, sample_rate: int) -> None:
-    """Stream audio chunks to speakers and save to file.
+def play_chunks(chunks: list[np.ndarray], output_path: Path | None, sample_rate: int) -> None:
+    """Stream audio chunks to speakers and optionally save to file.
 
     Args:
         chunks: List of audio chunks as numpy arrays.
-        output_path: Path to save the generated WAV file.
+        output_path: Path to save the generated WAV file, or None to skip saving.
         sample_rate: Sample rate in Hz.
     """
     with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32") as stream:
         for chunk in chunks:
             stream.write(chunk.reshape(-1, 1))
 
-    audio = np.concatenate(chunks)
-    save_audio(audio, output_path, sample_rate)
+    if output_path is not None:
+        audio = np.concatenate(chunks)
+        save_audio(audio, output_path, sample_rate)
 
 
 def audio_worker(
     work_queue: queue.Queue[str | None],
     model: TTSModel,
     voice: str,
-    output_path: Path,
+    output_path: Path | None,
     sample_rate: int,
 ) -> None:
     """Background worker that generates and plays TTS audio.
@@ -263,7 +264,7 @@ def audio_worker(
         work_queue: Queue of text strings to synthesize. None signals shutdown.
         model: Loaded TTS model.
         voice: Voice to use for synthesis.
-        output_path: Path to save generated audio.
+        output_path: Path to save generated audio, or None to skip saving.
         sample_rate: Sample rate in Hz.
     """
     pending_chunks: list[np.ndarray] | None = None

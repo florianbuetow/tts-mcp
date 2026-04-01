@@ -215,6 +215,30 @@ def shutdown_worker(work_queue: queue.Queue[str | None], worker: threading.Threa
     worker.join()
 
 
+def load_cli_config() -> tuple[int, bool, bool]:
+    """Load CLI-relevant settings from config.yaml.
+
+    Returns:
+        Tuple of (sample_rate, save_wav, simplify_punctuation).
+
+    Raises:
+        ValueError: If required keys are missing from config.yaml.
+    """
+    config = load_config()
+
+    raw_rate = config.get("sample_rate")
+    if raw_rate is None:
+        msg = "Missing required key 'sample_rate' in config.yaml"
+        raise ValueError(msg)
+
+    raw_save_wav = config.get("save_wav")
+    if raw_save_wav is None:
+        msg = "Missing required key 'save_wav' in config.yaml"
+        raise ValueError(msg)
+
+    return int(raw_rate), bool(raw_save_wav), bool(config.get("simplify_punctuation"))
+
+
 def main() -> None:
     """Main entry point for text-to-speech."""
     parser = create_argument_parser()
@@ -224,13 +248,7 @@ def main() -> None:
         list_outputs(OUTPUT_DIR)
         return
 
-    config = load_config()
-    raw_rate = config.get("sample_rate")
-    if raw_rate is None:
-        msg = "Missing required key 'sample_rate' in config.yaml"
-        raise ValueError(msg)
-    sample_rate = int(raw_rate)
-    simplify_punct = bool(config.get("simplify_punctuation"))
+    sample_rate, save_wav, simplify_punct = load_cli_config()
 
     model_dir = resolve_model_dir(args.model)
     available_voices = discover_voices(Path(model_dir))
@@ -251,7 +269,7 @@ def main() -> None:
     print(f"Voice: {voice}")
     print("Type text and press Enter. Press ESC to quit.\n")
 
-    output_path = make_output_path(OUTPUT_DIR)
+    output_path = make_output_path(OUTPUT_DIR) if save_wav else None
     work_queue: queue.Queue[str | None] = queue.Queue()
 
     worker = threading.Thread(

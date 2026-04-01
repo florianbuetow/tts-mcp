@@ -233,6 +233,18 @@ class TestPlayChunks:
         assert mock_stream.write.call_count == 2
         assert output_path.exists()
 
+    @patch("src.tts.sd")
+    def test_streams_chunks_without_saving_when_output_path_is_none(self, mock_sd: MagicMock) -> None:
+        mock_stream = MagicMock()
+        mock_sd.OutputStream.return_value.__enter__ = MagicMock(return_value=mock_stream)
+        mock_sd.OutputStream.return_value.__exit__ = MagicMock(return_value=False)
+
+        chunks = [np.ones(100, dtype=np.float32), np.ones(200, dtype=np.float32)]
+
+        play_chunks(chunks, None, sample_rate=24000)
+
+        assert mock_stream.write.call_count == 2
+
 
 class TestAudioWorker:
     """Tests for the audio_worker function."""
@@ -296,6 +308,30 @@ class TestAudioWorker:
 
         assert not t.is_alive()
         mock_model.generate.assert_not_called()
+
+    @patch("src.tts.play_chunks")
+    def test_processes_text_with_no_save(self, mock_play: MagicMock) -> None:
+        mock_model = MagicMock()
+        chunk = MagicMock()
+        chunk.audio = np.ones(100, dtype=np.float32)
+        mock_model.generate.return_value = [chunk]
+
+        work_queue: queue.Queue[str | None] = queue.Queue()
+        work_queue.put("hello world")
+        work_queue.put(None)
+
+        t = threading.Thread(
+            target=audio_worker,
+            args=(work_queue, mock_model, "casual_female", None, 24000),
+        )
+        t.start()
+        t.join(timeout=5)
+
+        assert not t.is_alive()
+        mock_model.generate.assert_called_once_with(text="hello world", voice="casual_female")
+        mock_play.assert_called_once()
+        call_args = mock_play.call_args
+        assert call_args[0][1] is None
 
 
 class TestMakeOutputPath:

@@ -25,6 +25,7 @@ def _make_state(
     default_voice: str = "casual_female",
     sample_rate: int = 24000,
     simplify_punctuation: bool = False,
+    save_wav: bool = True,
 ) -> ServerState:
     """Create a ServerState with a mock model for testing."""
     model = MagicMock()
@@ -36,6 +37,7 @@ def _make_state(
         default_voice=default_voice,
         sample_rate=sample_rate,
         simplify_punctuation=simplify_punctuation,
+        save_wav=save_wav,
     )
 
 
@@ -546,6 +548,44 @@ class TestServerAudioWorker:
             error = state.statuses[msg_id].error
             assert error is not None
             assert "Audio device error" in error
+
+
+class TestSaveWavDisabled:
+    """Tests for save_wav=False behavior."""
+
+    @patch("src.server.play_chunks")
+    def test_completes_without_audio_file_when_save_wav_disabled(self, mock_play: MagicMock) -> None:
+        state = _make_state(save_wav=False)
+        mock_chunk = MagicMock()
+        mock_chunk.audio = np.ones(100, dtype=np.float32)
+        model = cast(Any, state.model)
+        model.generate.return_value = [mock_chunk]
+
+        msg_id = "msg_nosave_001"
+        with state.status_lock:
+            state.statuses[msg_id] = MessageStatus(
+                message_id=msg_id,
+                status="queued",
+                text="Hello",
+                audio_file=None,
+                error=None,
+                completed_at=None,
+            )
+        state.work_queue.put(WorkItem(message_id=msg_id, text="Hello", voice="casual_female"))
+        state.work_queue.put(None)
+
+        t = threading.Thread(target=server_audio_worker, args=(state,))
+        t.start()
+        t.join(timeout=5)
+
+        assert not t.is_alive()
+        with state.status_lock:
+            assert state.statuses[msg_id].status == "completed"
+            assert state.statuses[msg_id].audio_file is None
+
+        mock_play.assert_called_once()
+        call_args = mock_play.call_args
+        assert call_args[0][1] is None
 
 
 class TestConcurrentSay:

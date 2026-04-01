@@ -65,6 +65,7 @@ class ServerState:
         default_voice: str,
         sample_rate: int,
         simplify_punctuation: bool,
+        save_wav: bool,
     ) -> None:
         """Initialize server state.
 
@@ -74,12 +75,14 @@ class ServerState:
             default_voice: Default voice for requests without voice override.
             sample_rate: Audio sample rate in Hz.
             simplify_punctuation: Whether to simplify punctuation before TTS.
+            save_wav: Whether to save generated audio to WAV files.
         """
         self.model = model
         self.voices = voices
         self.default_voice = default_voice
         self.sample_rate = sample_rate
         self.simplify_punctuation = simplify_punctuation
+        self.save_wav = save_wav
         self.work_queue: queue.Queue[WorkItem | None] = queue.Queue()
         self.statuses: dict[str, MessageStatus] = {}
         self.status_lock = threading.Lock()
@@ -232,7 +235,7 @@ def _finish_playback(
     state: ServerState,
     message_id: str,
     chunks: list[np.ndarray],
-    output_path: Path,
+    output_path: Path | None,
 ) -> None:
     """Play audio chunks and update message status to completed or error.
 
@@ -240,14 +243,14 @@ def _finish_playback(
         state: Server state with status dict and lock.
         message_id: ID of the message being played.
         chunks: Audio chunks to play.
-        output_path: Path to save the WAV file.
+        output_path: Path to save the WAV file, or None to skip saving.
     """
     try:
         play_chunks(chunks, output_path, state.sample_rate)
         with state.status_lock:
             ms = state.statuses[message_id]
             ms.status = "completed"
-            ms.audio_file = str(output_path)
+            ms.audio_file = str(output_path) if output_path is not None else None
             ms.completed_at = time.time()
         logger.debug("Playback completed for %s -> %s", message_id, output_path)
     except Exception as exc:
@@ -298,7 +301,7 @@ def _start_playback(
     with state.status_lock:
         state.statuses[work_item.message_id].status = "playing"
 
-    output_path = make_output_path(OUTPUT_DIR)
+    output_path = make_output_path(OUTPUT_DIR) if state.save_wav else None
     thread = threading.Thread(
         target=_finish_playback,
         args=(state, work_item.message_id, chunks, output_path),
@@ -389,6 +392,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
     simplify_punct = bool(config.get("simplify_punctuation"))
 
+    raw_save_wav = config.get("save_wav")
+    if raw_save_wav is None:
+        msg = "Missing required key 'save_wav' in config.yaml"
+        raise ValueError(msg)
+    save_wav = bool(raw_save_wav)
+
     available_voices = discover_voices(Path(model_path))
     if default_voice not in available_voices:
         msg = f"default_voice '{default_voice}' not found. Available: {', '.join(available_voices)}"
@@ -406,6 +415,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         default_voice=default_voice,
         sample_rate=sample_rate,
         simplify_punctuation=simplify_punct,
+        save_wav=save_wav,
     )
 
     worker = threading.Thread(target=server_audio_worker, args=(state,), daemon=True)
