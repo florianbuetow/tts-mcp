@@ -23,7 +23,7 @@ This file provides guidance to AI agents and AI-assisted development tools when 
 
 ## Testing
 - After **every change** to the code, the tests must be executed
-- Always verify the program runs correctly with `just run` after modifications
+- Always verify the program runs correctly with `just chat` after modifications
 
 ## Python Execution Rules
 - Python code must be executed **only** via `uv run ...`
@@ -42,7 +42,7 @@ This file provides guidance to AI agents and AI-assisted development tools when 
 - **Composite targets (e.g. `ci`) must fail fast**: use `set -e` or `&&` chaining.
 - All Python execution in the justfile uses `uv run`, never `python` directly
 - Use `just init` to set up the project
-- Use `just run` to execute the interactive CLI
+- Use `just chat` to run the interactive chat
 - Use `just serve` to start the FastAPI TTS server (foreground)
 - Use `just stop` to stop the running server
 - Use `just status` to check if the server is running

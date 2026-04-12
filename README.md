@@ -100,6 +100,10 @@ sample_rate: 24000
 default_voice: casual_female
 save_wav: true
 simplify_punctuation: false
+normalize_audio: true
+target_lufs: -20.0
+true_peak_ceiling_db: -1.0
+min_duration_seconds: 0.5
 host: 0.0.0.0
 port: 12000
 ```
@@ -112,14 +116,33 @@ port: 12000
 | `default_voice` | Default voice for server requests without a voice override |
 | `save_wav` | Save generated audio to WAV files in `data/output/` (`true` or `false`) |
 | `simplify_punctuation` | Strip commas, replace other marks with periods for cleaner speech |
+| `normalize_audio` | Enable boost-only LUFS loudness normalization per utterance (`true` or `false`) |
+| `target_lufs` | Target integrated loudness in LUFS when `normalize_audio` is enabled (e.g. `-20.0` for podcast mid) |
+| `true_peak_ceiling_db` | Maximum allowed true peak in dBFS after gain is applied (e.g. `-1.0`); measured via 4x oversampling |
+| `min_duration_seconds` | Utterances shorter than this are passed through unchanged (LUFS gating needs ~0.4s) |
 | `host` | Server listen address |
 | `port` | Server listen port |
+
+### Loudness normalization
+
+Different Voxtral voices produce audio at significantly different average levels. Enable `normalize_audio` to apply
+utterance-level loudness normalization following ITU-R BS.1770-4 (the EBU R128 standard used in broadcast):
+
+- The integrated loudness of each utterance is measured in LUFS using [`pyloudnorm`](https://github.com/csteinmetz1/pyloudnorm).
+- If the measurement is below `target_lufs`, a single scalar gain is applied to lift the utterance toward the target.
+- If the measurement is at or above the target, the audio is passed through unchanged — normalization is **boost-only
+  and never attenuates**, so already-loud voices are preserved exactly.
+- Before applying gain, the 4x-oversampled true peak is measured via `scipy.signal.resample_poly`. The gain is capped
+  so the resulting true peak stays at or below `true_peak_ceiling_db`, preventing inter-sample clipping.
+- Utterances shorter than `min_duration_seconds` and fully silent utterances are passed through unchanged.
+- The same normalized audio is used for both speaker playback and the saved WAV file, so there is no drift between
+  what you hear and what is written to disk.
 
 ## Usage
 
 | Command | Description |
 |---------|-------------|
-| `just run` | Start the interactive CLI |
+| `just chat` | Start the interactive chat |
 | `just serve` | Start the FastAPI TTS server (foreground) |
 | `just stop` | Stop the running server |
 | `just status` | Check if the server is running |
@@ -127,10 +150,10 @@ port: 12000
 ### CLI
 
 ```bash
-just run
+just chat
 ```
 
-Prompts for model and voice selection, then enters an interactive loop. Type text and press Enter to hear it spoken. Press ESC to quit.
+Prompts for model and voice selection, then enters an interactive loop. Type text and press Enter twice to submit. Press ESC twice to quit.
 
 For one-shot usage:
 

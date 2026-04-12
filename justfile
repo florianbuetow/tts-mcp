@@ -50,7 +50,7 @@ help:
     @printf "  %-40s %s\n" "help" "Show this help message"
     @echo ""
     @printf "\033[0;33mRun:\033[0m\n"
-    @printf "  %-40s %s\n" "run" "Run the main application"
+    @printf "  %-40s %s\n" "chat" "Run the interactive chat"
     @printf "  %-40s %s\n" "serve" "Start the FastAPI TTS server"
     @printf "  %-40s %s\n" "stop" "Stop the FastAPI TTS server"
     @printf "  %-40s %s\n" "status" "Check if the TTS server is running"
@@ -133,10 +133,10 @@ destroy:
     @printf "\033[0;32m✓ Virtual environment removed\033[0m\n"
     @echo ""
 
-# Run the main application
-run:
+# Run the interactive chat
+chat:
     @echo ""
-    @printf "\033[0;34m=== Running Application ===\033[0m\n"
+    @printf "\033[0;34m=== Running Interactive Chat ===\033[0m\n"
     @uv run -m src.main
     @echo ""
 

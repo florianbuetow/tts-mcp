@@ -7,6 +7,7 @@ from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pyloudnorm as pyln
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -26,11 +27,18 @@ def _make_state(
     sample_rate: int = 24000,
     simplify_punctuation: bool = False,
     save_wav: bool = True,
+    normalize_audio: bool = False,
+    target_lufs: float = -20.0,
+    true_peak_ceiling_db: float = -1.0,
+    min_duration_seconds: float = 0.5,
+    meter: pyln.Meter | None = None,
 ) -> ServerState:
     """Create a ServerState with a mock model for testing."""
     model = MagicMock()
     if voices is None:
         voices = ["casual_female", "casual_male"]
+    if meter is None:
+        meter = pyln.Meter(float(sample_rate))
     return ServerState(
         model=model,
         voices=voices,
@@ -38,6 +46,11 @@ def _make_state(
         sample_rate=sample_rate,
         simplify_punctuation=simplify_punctuation,
         save_wav=save_wav,
+        normalize_audio=normalize_audio,
+        target_lufs=target_lufs,
+        true_peak_ceiling_db=true_peak_ceiling_db,
+        min_duration_seconds=min_duration_seconds,
+        meter=meter,
     )
 
 

@@ -12,6 +12,8 @@ dependencies = [
     "pyyaml>=6.0",
     "fastapi>=0.115.0",
     "pydantic>=2.0.0",
+    "pyloudnorm>=0.2.0",
+    "scipy>=1.11.0",
     "uvicorn>=0.34.0",
 ]
 
@@ -138,7 +140,20 @@ exclude = [".venv/"]
 
 # Third-party libraries without type stubs
 [[tool.mypy.overrides]]
-module = ["sounddevice", "sounddevice.*", "mlx_audio", "mlx_audio.*", "mlx", "mlx.*", "uvicorn", "uvicorn.*"]
+module = [
+    "sounddevice",
+    "sounddevice.*",
+    "mlx_audio",
+    "mlx_audio.*",
+    "mlx",
+    "mlx.*",
+    "uvicorn",
+    "uvicorn.*",
+    "pyloudnorm",
+    "pyloudnorm.*",
+    "scipy",
+    "scipy.*",
+]
 ignore_missing_imports = true
 
 # Tests – still type checked, but not fully strict

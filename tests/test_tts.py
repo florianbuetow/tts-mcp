@@ -6,7 +6,9 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pyloudnorm as pyln
 import pytest
+from scipy.signal import resample_poly
 
 from src.tts import (
     audio_worker,
@@ -17,11 +19,31 @@ from src.tts import (
     generate_speech,
     load_config,
     make_output_path,
+    normalize_chunks,
     play_audio,
     play_chunks,
     save_audio,
     simplify_punctuation,
 )
+
+_SR = 24000
+_TEST_METER = pyln.Meter(float(_SR))
+
+
+def _worker_args(
+    work_queue: queue.Queue[str | None],
+    model: MagicMock,
+    voice: str,
+    output_path: Path | None,
+) -> tuple[queue.Queue[str | None], MagicMock, str, Path | None, int, bool, float, float, float, pyln.Meter]:
+    """Build the positional args tuple for audio_worker with normalization disabled."""
+    return (work_queue, model, voice, output_path, _SR, False, -20.0, -1.0, 0.5, _TEST_METER)
+
+
+def _make_sine(duration_s: float, freq_hz: float, amplitude: float, sample_rate: int = _SR) -> np.ndarray:
+    n = int(duration_s * sample_rate)
+    t = np.arange(n, dtype=np.float32) / sample_rate
+    return (np.sin(2.0 * np.pi * freq_hz * t) * amplitude).astype(np.float32)
 
 
 class TestLoadConfig:
@@ -262,7 +284,7 @@ class TestAudioWorker:
 
         t = threading.Thread(
             target=audio_worker,
-            args=(work_queue, mock_model, "casual_female", tmp_path / "out.wav", 24000),
+            args=_worker_args(work_queue, mock_model, "casual_female", tmp_path / "out.wav"),
         )
         t.start()
         t.join(timeout=5)
@@ -284,7 +306,7 @@ class TestAudioWorker:
 
         t = threading.Thread(
             target=audio_worker,
-            args=(work_queue, mock_model, "neutral_male", tmp_path / "out.wav", 24000),
+            args=_worker_args(work_queue, mock_model, "neutral_male", tmp_path / "out.wav"),
         )
         t.start()
         t.join(timeout=5)
@@ -301,7 +323,7 @@ class TestAudioWorker:
 
         t = threading.Thread(
             target=audio_worker,
-            args=(work_queue, mock_model, "casual_female", tmp_path / "out.wav", 24000),
+            args=_worker_args(work_queue, mock_model, "casual_female", tmp_path / "out.wav"),
         )
         t.start()
         t.join(timeout=5)
@@ -322,7 +344,7 @@ class TestAudioWorker:
 
         t = threading.Thread(
             target=audio_worker,
-            args=(work_queue, mock_model, "casual_female", None, 24000),
+            args=_worker_args(work_queue, mock_model, "casual_female", None),
         )
         t.start()
         t.join(timeout=5)
@@ -373,7 +395,7 @@ class TestCleanText:
         assert clean_text("\t\thello\t\tworld") == "hello world"
 
     def test_mixed_whitespace(self):
-        assert clean_text("  hello \t world \n\n next  ") == "hello world\nnext"
+        assert clean_text("  hello \t world \n\n next  ") == "hello world \n next"
 
 
 class TestSimplifyPunctuation:
@@ -417,3 +439,142 @@ class TestSimplifyPunctuation:
 
     def test_semicolon_to_period(self):
         assert simplify_punctuation("first; second") == "first. second"
+
+
+class TestNormalizeChunks:
+    """Tests for the normalize_chunks function."""
+
+    def test_passthrough_when_already_loud_enough(self):
+        chunk = _make_sine(duration_s=1.0, freq_hz=440.0, amplitude=0.5)
+        chunks = [chunk]
+
+        result = normalize_chunks(
+            chunks,
+            sample_rate=_SR,
+            target_lufs=-20.0,
+            true_peak_ceiling_db=-1.0,
+            min_duration_seconds=0.5,
+            meter=_TEST_METER,
+        )
+
+        assert len(result) == 1
+        assert np.array_equal(result[0], chunk)
+        assert result[0] is chunk  # passthrough returns the exact original list
+
+    def test_boost_applied_when_quiet(self):
+        quiet = _make_sine(duration_s=2.0, freq_hz=440.0, amplitude=0.01)
+        chunks = [quiet]
+
+        result = normalize_chunks(
+            chunks,
+            sample_rate=_SR,
+            target_lufs=-20.0,
+            true_peak_ceiling_db=-1.0,
+            min_duration_seconds=0.5,
+            meter=_TEST_METER,
+        )
+
+        assert len(result) == 1
+        assert result[0].shape == quiet.shape
+
+        input_peak = float(np.max(np.abs(quiet)))
+        output_peak = float(np.max(np.abs(result[0])))
+        assert output_peak > input_peak  # was boosted
+
+        fresh_meter = pyln.Meter(float(_SR))
+        measured = float(fresh_meter.integrated_loudness(np.concatenate(result)))
+        # Either we hit the target, or we were gain-capped by true-peak headroom.
+        ceiling_linear = 10.0 ** (-1.0 / 20.0)
+        assert output_peak <= ceiling_linear + 1e-6
+        assert measured <= -20.0 + 1.0  # not overshooting target by more than 1 LU
+
+    def test_gain_capped_by_true_peak_headroom(self):
+        # Input amplitude 0.5 -> TP around -6 dBFS, leaving ~5 dB of boost headroom
+        # before the -1 dBTP ceiling. Target of 0.0 LUFS is unreachable and would
+        # require far more than 5 dB of gain, so the true-peak cap must engage
+        # and the output TP must not exceed the ceiling.
+        medium = _make_sine(duration_s=2.0, freq_hz=440.0, amplitude=0.5)
+        chunks = [medium]
+
+        result = normalize_chunks(
+            chunks,
+            sample_rate=_SR,
+            target_lufs=0.0,  # unreachable without clipping
+            true_peak_ceiling_db=-1.0,
+            min_duration_seconds=0.5,
+            meter=_TEST_METER,
+        )
+
+        concatenated = np.concatenate(result)
+        oversampled = resample_poly(concatenated, up=4, down=1)
+        output_tp = float(np.max(np.abs(oversampled)))
+        ceiling_linear = 10.0 ** (-1.0 / 20.0)
+        assert output_tp <= ceiling_linear + 1e-6  # ceiling never exceeded
+        # And the cap actually kicked in: output is meaningfully louder than input.
+        assert output_tp > 0.5 * 1.5  # input peak was ~0.5; gain was applied
+
+    def test_short_audio_passthrough(self):
+        short = _make_sine(duration_s=0.3, freq_hz=440.0, amplitude=0.01)
+        chunks = [short]
+
+        result = normalize_chunks(
+            chunks,
+            sample_rate=_SR,
+            target_lufs=-20.0,
+            true_peak_ceiling_db=-1.0,
+            min_duration_seconds=0.5,
+            meter=_TEST_METER,
+        )
+
+        assert result is chunks
+        assert np.array_equal(result[0], short)
+
+    def test_silent_audio_passthrough(self):
+        silent = np.zeros(int(2.0 * _SR), dtype=np.float32)
+        chunks = [silent]
+
+        result = normalize_chunks(
+            chunks,
+            sample_rate=_SR,
+            target_lufs=-20.0,
+            true_peak_ceiling_db=-1.0,
+            min_duration_seconds=0.5,
+            meter=_TEST_METER,
+        )
+
+        assert result is chunks
+        assert np.array_equal(result[0], silent)
+
+    def test_chunk_boundaries_preserved(self):
+        full = _make_sine(duration_s=20000 / _SR, freq_hz=440.0, amplitude=0.01)
+        assert len(full) == 20000
+        chunks = [full[:5000].copy(), full[5000:17000].copy(), full[17000:].copy()]
+        original_lens = [len(c) for c in chunks]
+
+        result = normalize_chunks(
+            chunks,
+            sample_rate=_SR,
+            target_lufs=-20.0,
+            true_peak_ceiling_db=-1.0,
+            min_duration_seconds=0.5,
+            meter=_TEST_METER,
+        )
+
+        assert [len(c) for c in result] == original_lens
+        assert np.concatenate(result).shape == (20000,)
+
+    def test_float32_dtype_preserved(self):
+        quiet = _make_sine(duration_s=2.0, freq_hz=440.0, amplitude=0.01)
+        chunks = [quiet]
+
+        result = normalize_chunks(
+            chunks,
+            sample_rate=_SR,
+            target_lufs=-20.0,
+            true_peak_ceiling_db=-1.0,
+            min_duration_seconds=0.5,
+            meter=_TEST_METER,
+        )
+
+        for c in result:
+            assert c.dtype == np.float32

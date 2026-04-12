@@ -1,6 +1,7 @@
 """CLI frontend for text-to-speech using Voxtral via mlx-audio."""
 
 import argparse
+import dataclasses
 import datetime
 import queue
 import sys
@@ -9,6 +10,7 @@ import threading
 import tty
 from pathlib import Path
 
+import pyloudnorm as pyln
 from mlx_audio.tts.utils import load
 
 from src.tts import (
@@ -21,6 +23,16 @@ from src.tts import (
     make_output_path,
     simplify_punctuation,
 )
+
+
+@dataclasses.dataclass(frozen=True)
+class NormalizationSettings:
+    """Loudness normalization configuration loaded from config.yaml."""
+
+    enabled: bool
+    target_lufs: float
+    true_peak_ceiling_db: float
+    min_duration_seconds: float
 
 
 def select_model(models: list[Path]) -> Path:
@@ -72,13 +84,15 @@ def select_voice(voices: list[str]) -> str:
 
 
 def read_input(prompt: str) -> str | None:
-    """Read a line of input, character by character. ESC exits, returns None.
+    """Read a line of input, character by character. Double-ESC exits, returns None.
+
+    Enter once inserts a newline; Enter twice submits the input.
 
     Args:
         prompt: The prompt to display.
 
     Returns:
-        The entered text, or None if ESC was pressed.
+        The entered text, or None if ESC was pressed twice.
     """
     sys.stdout.write(prompt)
     sys.stdout.flush()
@@ -86,6 +100,8 @@ def read_input(prompt: str) -> str | None:
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     buf: list[str] = []
+    last_was_esc = False
+    last_was_enter = False
 
     try:
         tty.setraw(fd)
@@ -93,16 +109,28 @@ def read_input(prompt: str) -> str | None:
             ch = sys.stdin.read(1)
 
             if ch == "\x1b":  # ESC
-                sys.stdout.write("\r\n")
-                sys.stdout.flush()
-                return None
+                if last_was_esc:
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    return None
+                last_was_esc = True
+                last_was_enter = False
+                continue
 
             if ch in ("\r", "\n"):  # Enter
+                if last_was_enter:
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    return "".join(buf)
+                last_was_enter = True
+                last_was_esc = False
                 sys.stdout.write("\r\n")
                 sys.stdout.flush()
-                return "".join(buf)
+                continue
 
             if ch in ("\x7f", "\x08"):  # Backspace
+                last_was_esc = False
+                last_was_enter = False
                 if buf:
                     buf.pop()
                     sys.stdout.write("\b \b")
@@ -114,6 +142,10 @@ def read_input(prompt: str) -> str | None:
                 sys.stdout.flush()
                 return None
 
+            if last_was_enter:
+                buf.append("\n")
+            last_was_esc = False
+            last_was_enter = False
             buf.append(ch)
             sys.stdout.write(ch)
             sys.stdout.flush()
@@ -215,11 +247,11 @@ def shutdown_worker(work_queue: queue.Queue[str | None], worker: threading.Threa
     worker.join()
 
 
-def load_cli_config() -> tuple[int, bool, bool]:
+def load_cli_config() -> tuple[int, bool, bool, NormalizationSettings]:
     """Load CLI-relevant settings from config.yaml.
 
     Returns:
-        Tuple of (sample_rate, save_wav, simplify_punctuation).
+        Tuple of (sample_rate, save_wav, simplify_punctuation, normalization).
 
     Raises:
         ValueError: If required keys are missing from config.yaml.
@@ -236,7 +268,34 @@ def load_cli_config() -> tuple[int, bool, bool]:
         msg = "Missing required key 'save_wav' in config.yaml"
         raise ValueError(msg)
 
-    return int(raw_rate), bool(raw_save_wav), bool(config.get("simplify_punctuation"))
+    raw_normalize = config.get("normalize_audio")
+    if raw_normalize is None:
+        msg = "Missing required key 'normalize_audio' in config.yaml"
+        raise ValueError(msg)
+
+    raw_target_lufs = config.get("target_lufs")
+    if raw_target_lufs is None:
+        msg = "Missing required key 'target_lufs' in config.yaml"
+        raise ValueError(msg)
+
+    raw_tp_ceiling = config.get("true_peak_ceiling_db")
+    if raw_tp_ceiling is None:
+        msg = "Missing required key 'true_peak_ceiling_db' in config.yaml"
+        raise ValueError(msg)
+
+    raw_min_duration = config.get("min_duration_seconds")
+    if raw_min_duration is None:
+        msg = "Missing required key 'min_duration_seconds' in config.yaml"
+        raise ValueError(msg)
+
+    normalization = NormalizationSettings(
+        enabled=bool(raw_normalize),
+        target_lufs=float(raw_target_lufs),
+        true_peak_ceiling_db=float(raw_tp_ceiling),
+        min_duration_seconds=float(raw_min_duration),
+    )
+
+    return int(raw_rate), bool(raw_save_wav), bool(config.get("simplify_punctuation")), normalization
 
 
 def main() -> None:
@@ -248,7 +307,7 @@ def main() -> None:
         list_outputs(OUTPUT_DIR)
         return
 
-    sample_rate, save_wav, simplify_punct = load_cli_config()
+    sample_rate, save_wav, simplify_punct, normalization = load_cli_config()
 
     model_dir = resolve_model_dir(args.model)
     available_voices = discover_voices(Path(model_dir))
@@ -272,9 +331,22 @@ def main() -> None:
     output_path = make_output_path(OUTPUT_DIR) if save_wav else None
     work_queue: queue.Queue[str | None] = queue.Queue()
 
+    meter = pyln.Meter(float(sample_rate))
+
     worker = threading.Thread(
         target=audio_worker,
-        args=(work_queue, model, voice, output_path, sample_rate),
+        args=(
+            work_queue,
+            model,
+            voice,
+            output_path,
+            sample_rate,
+            normalization.enabled,
+            normalization.target_lufs,
+            normalization.true_peak_ceiling_db,
+            normalization.min_duration_seconds,
+            meter,
+        ),
         daemon=True,
     )
     worker.start()

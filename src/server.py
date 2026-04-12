@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import cast
 
 import numpy as np
+import pyloudnorm as pyln
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
@@ -25,6 +26,7 @@ from src.tts import (
     generate_chunks,
     load_config,
     make_output_path,
+    normalize_chunks,
     play_chunks,
     simplify_punctuation,
 )
@@ -66,6 +68,11 @@ class ServerState:
         sample_rate: int,
         simplify_punctuation: bool,
         save_wav: bool,
+        normalize_audio: bool,
+        target_lufs: float,
+        true_peak_ceiling_db: float,
+        min_duration_seconds: float,
+        meter: pyln.Meter,
     ) -> None:
         """Initialize server state.
 
@@ -76,6 +83,11 @@ class ServerState:
             sample_rate: Audio sample rate in Hz.
             simplify_punctuation: Whether to simplify punctuation before TTS.
             save_wav: Whether to save generated audio to WAV files.
+            normalize_audio: Whether to apply utterance-level loudness normalization.
+            target_lufs: Target integrated loudness in LUFS.
+            true_peak_ceiling_db: Maximum true-peak level in dBFS after gain.
+            min_duration_seconds: Minimum utterance length to attempt normalization.
+            meter: Pre-constructed pyloudnorm Meter matching sample_rate.
         """
         self.model = model
         self.voices = voices
@@ -83,6 +95,11 @@ class ServerState:
         self.sample_rate = sample_rate
         self.simplify_punctuation = simplify_punctuation
         self.save_wav = save_wav
+        self.normalize_audio = normalize_audio
+        self.target_lufs = target_lufs
+        self.true_peak_ceiling_db = true_peak_ceiling_db
+        self.min_duration_seconds = min_duration_seconds
+        self.meter = meter
         self.work_queue: queue.Queue[WorkItem | None] = queue.Queue()
         self.statuses: dict[str, MessageStatus] = {}
         self.status_lock = threading.Lock()
@@ -342,6 +359,15 @@ def server_audio_worker(state: ServerState) -> None:
 
             try:
                 chunks = generate_chunks(state.model, item.text, item.voice)
+                if state.normalize_audio and chunks:
+                    chunks = normalize_chunks(
+                        chunks,
+                        state.sample_rate,
+                        state.target_lufs,
+                        state.true_peak_ceiling_db,
+                        state.min_duration_seconds,
+                        state.meter,
+                    )
                 pending = (item, chunks)
             except (RuntimeError, ValueError) as exc:
                 logger.error("TTS generation failed for %s: %s", item.message_id, exc)
@@ -364,59 +390,90 @@ def server_audio_worker(state: ServerState) -> None:
         _start_playback(state, pending, playback_thread)
 
 
+@dataclasses.dataclass(frozen=True)
+class _ServerConfig:
+    """Parsed server configuration from config.yaml."""
+
+    model_path: str
+    sample_rate: int
+    default_voice: str
+    simplify_punctuation: bool
+    save_wav: bool
+    normalize_audio: bool
+    target_lufs: float
+    true_peak_ceiling_db: float
+    min_duration_seconds: float
+
+
+def _require(config: dict[str, object], key: str) -> object:
+    """Fetch a required config key or raise ValueError with a clear message."""
+    value = config.get(key)
+    if value is None:
+        msg = f"Missing required key '{key}' in config.yaml"
+        raise ValueError(msg)
+    return value
+
+
+def _parse_server_config() -> _ServerConfig:
+    """Load and validate server settings from config.yaml. Fails fast on missing keys."""
+    config = load_config()
+
+    model_path = _require(config, "model")
+    if not isinstance(model_path, str) or not Path(model_path).exists():
+        msg = f"Model directory does not exist: {model_path!r}"
+        raise FileNotFoundError(msg)
+
+    default_voice = _require(config, "default_voice")
+    if not isinstance(default_voice, str):
+        msg = "'default_voice' in config.yaml must be a string"
+        raise ValueError(msg)
+
+    return _ServerConfig(
+        model_path=model_path,
+        sample_rate=int(cast(int, _require(config, "sample_rate"))),
+        default_voice=default_voice,
+        simplify_punctuation=bool(config.get("simplify_punctuation")),
+        save_wav=bool(_require(config, "save_wav")),
+        normalize_audio=bool(_require(config, "normalize_audio")),
+        target_lufs=float(cast(float, _require(config, "target_lufs"))),
+        true_peak_ceiling_db=float(cast(float, _require(config, "true_peak_ceiling_db"))),
+        min_duration_seconds=float(cast(float, _require(config, "min_duration_seconds"))),
+    )
+
+
+def _build_server_state(cfg: _ServerConfig) -> ServerState:
+    """Load the MLX model and assemble a ServerState from parsed config."""
+    from mlx_audio.tts.utils import load
+
+    available_voices = discover_voices(Path(cfg.model_path))
+    if cfg.default_voice not in available_voices:
+        msg = f"default_voice '{cfg.default_voice}' not found. Available: {', '.join(available_voices)}"
+        raise ValueError(msg)
+
+    model = load(cfg.model_path)
+    if not hasattr(model, "generate") or model.generate is None:
+        msg = f"Model {cfg.model_path} does not support generation"
+        raise RuntimeError(msg)
+
+    return ServerState(
+        model=cast(TTSModel, model),
+        voices=available_voices,
+        default_voice=cfg.default_voice,
+        sample_rate=cfg.sample_rate,
+        simplify_punctuation=cfg.simplify_punctuation,
+        save_wav=cfg.save_wav,
+        normalize_audio=cfg.normalize_audio,
+        target_lufs=cfg.target_lufs,
+        true_peak_ceiling_db=cfg.true_peak_ceiling_db,
+        min_duration_seconds=cfg.min_duration_seconds,
+        meter=pyln.Meter(float(cfg.sample_rate)),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Load model on startup, shut down worker on exit."""
-    from mlx_audio.tts.utils import load
-
-    config = load_config()
-
-    model_path = config.get("model")
-    if not model_path:
-        msg = "Missing required key 'model' in config.yaml"
-        raise ValueError(msg)
-    if not Path(model_path).exists():
-        msg = f"Model directory does not exist: {model_path}"
-        raise FileNotFoundError(msg)
-
-    raw_rate = config.get("sample_rate")
-    if raw_rate is None:
-        msg = "Missing required key 'sample_rate' in config.yaml"
-        raise ValueError(msg)
-    sample_rate = int(raw_rate)
-
-    default_voice = config.get("default_voice")
-    if not default_voice:
-        msg = "Missing required key 'default_voice' in config.yaml"
-        raise ValueError(msg)
-
-    simplify_punct = bool(config.get("simplify_punctuation"))
-
-    raw_save_wav = config.get("save_wav")
-    if raw_save_wav is None:
-        msg = "Missing required key 'save_wav' in config.yaml"
-        raise ValueError(msg)
-    save_wav = bool(raw_save_wav)
-
-    available_voices = discover_voices(Path(model_path))
-    if default_voice not in available_voices:
-        msg = f"default_voice '{default_voice}' not found. Available: {', '.join(available_voices)}"
-        raise ValueError(msg)
-
-    model = load(model_path)
-
-    if not hasattr(model, "generate") or model.generate is None:
-        msg = f"Model {model_path} does not support generation"
-        raise RuntimeError(msg)
-
-    state = ServerState(
-        model=cast(TTSModel, model),
-        voices=available_voices,
-        default_voice=default_voice,
-        sample_rate=sample_rate,
-        simplify_punctuation=simplify_punct,
-        save_wav=save_wav,
-    )
+    state = _build_server_state(_parse_server_config())
 
     worker = threading.Thread(target=server_audio_worker, args=(state,), daemon=True)
     worker.start()

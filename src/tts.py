@@ -1,6 +1,7 @@
 """Shared TTS engine: config, model/voice discovery, audio generation, playback, and saving."""
 
 import datetime
+import math
 import queue
 import re
 import sys
@@ -11,9 +12,11 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 import numpy as np
+import pyloudnorm as pyln
 import sounddevice as sd
 import yaml
 from mlx_audio.tts.utils import load
+from scipy.signal import resample_poly
 
 OUTPUT_DIR = Path("data/output")
 CONFIG_PATH = Path("config.yaml")
@@ -46,9 +49,9 @@ def clean_text(text: str) -> str:
         Cleaned text. Empty string if input was only whitespace.
     """
     text = text.strip()
-    text = re.sub(r"[^\S\n]+", " ", text)
+    text = re.sub(r"\t", " ", text)
+    text = re.sub(r" {2,}", " ", text)
     text = re.sub(r"\n{2,}", "\n", text)
-    text = re.sub(r" *\n *", "\n", text)
     text = text.strip()
     return text
 
@@ -231,6 +234,79 @@ def generate_chunks(model: TTSModel, text: str, voice: str) -> list[np.ndarray]:
     return [np.array(result.audio, dtype=np.float32) for result in model.generate(text=text, voice=voice)]
 
 
+def normalize_chunks(
+    chunks: list[np.ndarray],
+    sample_rate: int,
+    target_lufs: float,
+    true_peak_ceiling_db: float,
+    min_duration_seconds: float,
+    meter: pyln.Meter,
+) -> list[np.ndarray]:
+    """Apply boost-only LUFS normalization to a list of audio chunks.
+
+    Measures integrated loudness of the concatenated audio using ITU-R BS.1770-4.
+    If the measured loudness is below target_lufs, applies a positive gain to
+    bring it up, capped so the resulting true peak (measured via 4x oversampling)
+    does not exceed true_peak_ceiling_db. Never attenuates. Returns the chunks
+    unchanged if the audio is shorter than min_duration_seconds, silent, or
+    already at or above the target.
+
+    Args:
+        chunks: List of float32 audio chunks.
+        sample_rate: Sample rate in Hz.
+        target_lufs: Target integrated loudness in LUFS (e.g. -20.0).
+        true_peak_ceiling_db: Maximum allowed true-peak level in dBFS (e.g. -1.0).
+        min_duration_seconds: Minimum duration to attempt normalization (shorter
+            utterances are returned unchanged).
+        meter: Pre-constructed pyloudnorm Meter matching sample_rate.
+
+    Returns:
+        List of chunks with identical lengths and dtype. Either unchanged
+        (passthrough) or scaled by a single scalar gain.
+    """
+    if not chunks:
+        return chunks
+
+    lens = [len(c) for c in chunks]
+    audio = np.concatenate(chunks).astype(np.float32, copy=True)
+
+    if len(audio) < int(min_duration_seconds * sample_rate):
+        return chunks
+
+    if float(np.max(np.abs(audio))) == 0.0:
+        return chunks
+
+    integrated = float(meter.integrated_loudness(audio))
+    if math.isinf(integrated) or math.isnan(integrated):
+        return chunks
+
+    if integrated >= target_lufs:
+        return chunks
+
+    gain_wanted_db = target_lufs - integrated
+
+    oversampled = resample_poly(audio, up=4, down=1)
+    peak = float(np.max(np.abs(oversampled)))
+    if peak <= 0.0:
+        return chunks
+    tp_db = 20.0 * math.log10(peak)
+
+    gain_max_db = true_peak_ceiling_db - tp_db
+    if gain_max_db <= 0.0:
+        return chunks
+
+    gain_db = min(gain_wanted_db, gain_max_db)
+    if gain_db <= 0.0:
+        return chunks
+
+    scalar = float(10.0 ** (gain_db / 20.0))
+    audio *= scalar
+
+    split_idx = np.cumsum(lens[:-1])
+    out = np.split(audio, split_idx)
+    return [part.astype(np.float32, copy=False) for part in out]
+
+
 def play_chunks(chunks: list[np.ndarray], output_path: Path | None, sample_rate: int) -> None:
     """Stream audio chunks to speakers and optionally save to file.
 
@@ -254,6 +330,11 @@ def audio_worker(
     voice: str,
     output_path: Path | None,
     sample_rate: int,
+    normalize_audio: bool,
+    target_lufs: float,
+    true_peak_ceiling_db: float,
+    min_duration_seconds: float,
+    meter: pyln.Meter,
 ) -> None:
     """Background worker that generates and plays TTS audio.
 
@@ -266,6 +347,11 @@ def audio_worker(
         voice: Voice to use for synthesis.
         output_path: Path to save generated audio, or None to skip saving.
         sample_rate: Sample rate in Hz.
+        normalize_audio: Whether to apply boost-only LUFS normalization.
+        target_lufs: Target integrated loudness in LUFS when normalization is enabled.
+        true_peak_ceiling_db: Maximum true-peak level in dBFS after gain.
+        min_duration_seconds: Minimum utterance length to attempt normalization.
+        meter: Pre-constructed pyloudnorm Meter matching sample_rate.
     """
     pending_chunks: list[np.ndarray] | None = None
     playback_thread: threading.Thread | None = None
@@ -290,7 +376,17 @@ def audio_worker(
             break
 
         try:
-            pending_chunks = generate_chunks(model, text, voice)
+            generated = generate_chunks(model, text, voice)
+            if normalize_audio and generated:
+                generated = normalize_chunks(
+                    generated,
+                    sample_rate,
+                    target_lufs,
+                    true_peak_ceiling_db,
+                    min_duration_seconds,
+                    meter,
+                )
+            pending_chunks = generated
         except (RuntimeError, ValueError) as exc:
             print(f"\n  Error: {exc}", file=sys.stderr)
         work_queue.task_done()

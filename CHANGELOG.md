@@ -7,8 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Renamed `just run` to `just chat` across justfile, README, and CLAUDE.md
+- Interactive chat now requires pressing Enter twice to submit text, allowing multi-line input
+- Interactive chat now requires pressing ESC twice to quit instead of once
+- Empty enter no longer quits the interactive chat
+- Improved `clean_text` input sanitization: tabs replaced with spaces, consecutive spaces and newlines collapsed independently without merging different whitespace types
+
 ### Added
 
+- Utterance-level loudness normalization using ITU-R BS.1770-4 integrated LUFS measurement via `pyloudnorm`. Boost-only and asymmetric: quiet voices are lifted toward `target_lufs`, loud voices are left unchanged. Gain is capped by the 4x-oversampled true-peak measured with `scipy.signal.resample_poly` so the configured `true_peak_ceiling_db` is never exceeded. Controlled by four new `config.yaml` keys: `normalize_audio`, `target_lufs`, `true_peak_ceiling_db`, `min_duration_seconds`. A single `pyloudnorm.Meter` is constructed once per worker startup and reused for every utterance.
+- Type stubs for `pyloudnorm` and `scipy.signal` under `stubs/` to satisfy pyright strict mode
 - TTS engine core with streaming audio generation, playback, and WAV file saving using Voxtral models via mlx-audio
 - Interactive CLI frontend with voice/model selection, raw terminal input, and background audio worker
 - FastAPI TTS server with queued sequential playback, message status tracking, and automatic status eviction

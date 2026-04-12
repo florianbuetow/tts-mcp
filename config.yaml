@@ -4,5 +4,9 @@ sample_rate: 24000
 default_voice: casual_female
 save_wav: true
 simplify_punctuation: false
+normalize_audio: true
+target_lufs: -20.0
+true_peak_ceiling_db: -1.0
+min_duration_seconds: 0.5
 host: 0.0.0.0
 port: 12000
