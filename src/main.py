@@ -326,7 +326,7 @@ def main() -> None:
         sys.exit(1)
 
     print(f"Voice: {voice}")
-    print("Type text and press Enter. Press ESC to quit.\n")
+    print("Type text. Press Enter twice to submit (single Enter inserts a newline). Press ESC twice to quit.\n")
 
     output_path = make_output_path(OUTPUT_DIR) if save_wav else None
     work_queue: queue.Queue[str | None] = queue.Queue()
