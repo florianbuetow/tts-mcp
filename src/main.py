@@ -84,15 +84,16 @@ def select_voice(voices: list[str]) -> str:
 
 
 def read_input(prompt: str) -> str | None:
-    """Read a line of input, character by character. Double-ESC exits, returns None.
+    """Read a line of input, character by character. Returns None on exit.
 
-    Enter once inserts a newline; Enter twice submits the input.
+    Enter once inserts a newline; Enter twice submits the buffer. Pressing
+    Enter twice with an empty buffer exits, as does pressing ESC twice.
 
     Args:
         prompt: The prompt to display.
 
     Returns:
-        The entered text, or None if ESC was pressed twice.
+        The entered text, or None if the user chose to exit.
     """
     sys.stdout.write(prompt)
     sys.stdout.flush()
@@ -121,7 +122,7 @@ def read_input(prompt: str) -> str | None:
                 if last_was_enter:
                     sys.stdout.write("\r\n")
                     sys.stdout.flush()
-                    return "".join(buf)
+                    return "".join(buf) or None
                 last_was_enter = True
                 last_was_esc = False
                 sys.stdout.write("\r\n")
@@ -326,7 +327,7 @@ def main() -> None:
         sys.exit(1)
 
     print(f"Voice: {voice}")
-    print("Type text. Press Enter twice to submit (single Enter inserts a newline). Press ESC twice to quit.\n")
+    print("Type text. Enter twice submits (single Enter = newline). Enter twice on empty input or ESC twice quits.\n")
 
     output_path = make_output_path(OUTPUT_DIR) if save_wav else None
     work_queue: queue.Queue[str | None] = queue.Queue()
