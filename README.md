@@ -25,60 +25,49 @@ All configuration is explicit — no hardcoded defaults, no silent fallbacks. If
 
 There are two independent entry paths into the system. The interactive CLI (`src/main.py`) loads the model in-process and talks to the shared TTS engine directly. The FastAPI server (`src/server.py`) loads the model once at startup and serializes all requests through a work queue and a background audio worker with lookahead generation. AI agents reach the server through the MCP relay (`mcp/tts-mcp.ts`), a thin stdio-to-HTTP bridge; any plain HTTP client can call the REST API directly. In both paths, inference runs on the Apple Silicon GPU via MLX (Metal), with the Voxtral model weights held in unified memory.
 
-```mermaid
-flowchart TB
-    subgraph clients["Clients"]
-        agent["AI Agent<br/>Claude Code / Claude Desktop"]
-        curl["HTTP Client<br/>curl / scripts"]
-        terminal["Terminal User"]
-    end
-
-    subgraph mcpserver["MCP Server — mcp/tts-mcp.ts (Node.js)"]
-        relay["Transparent relay<br/>Tools: say · get_voices · get_status"]
-    end
-
-    subgraph fastapi["FastAPI Server — src/server.py"]
-        api["REST API<br/>POST /say · GET /voices · GET /status · GET /health"]
-        wq[["Work queue"]]
-        worker["Audio worker thread<br/>lookahead generation"]
-    end
-
-    subgraph cli["CLI — src/main.py"]
-        chat["Interactive chat<br/>model & voice selection"]
-    end
-
-    subgraph engine["Shared TTS Engine — src/tts.py"]
-        gen["Streaming generation"]
-        norm["Loudness normalization<br/>pyloudnorm · BS.1770-4"]
-        play["Playback<br/>sounddevice"]
-        save["WAV writer"]
-    end
-
-    subgraph gpu["Apple Silicon GPU — Metal via MLX"]
-        model["Voxtral 4B TTS model<br/>4-bit / 6-bit / bf16<br/>loaded once into unified memory"]
-    end
-
-    config["config.yaml"]
-    speakers(["Speakers"])
-    wavfiles[("data/output/*.wav")]
-
-    agent -- "MCP (stdio)" --> relay
-    relay -- "HTTP" --> api
-    curl -- "HTTP" --> api
-    terminal --> chat
-
-    api --> wq --> worker --> gen
-    chat --> gen
-
-    gen -- "inference" --> model
-    model -- "audio chunks" --> gen
-    gen --> norm
-    norm --> play --> speakers
-    norm --> save --> wavfiles
-
-    config -.->|server URL| relay
-    config -.->|model path · audio settings| api
-    config -.->|model path · audio settings| chat
+```text
+┌───────────────────────────┐  ┌───────────────────────────┐  ┌───────────────────────────┐
+│         AI Agent          │  │        HTTP Client        │  │       Terminal User       │
+│   Claude Code / Desktop   │  │      curl / scripts       │  │         just chat         │
+└─────────────┬─────────────┘  └─────────────┬─────────────┘  └─────────────┬─────────────┘
+              │ MCP (stdio)                  │ HTTP                         │
+              ▼                              │                              ▼
+┌───────────────────────────┐                │                ┌───────────────────────────┐
+│   MCP Server (Node.js)    │                │                │     CLI · src/main.py     │
+│      mcp/tts-mcp.ts       │                │                │     interactive chat      │
+│  tools: say, get_voices,  │                │                │  model & voice selection  │
+│        get_status         │                │                └─────────────┬─────────────┘
+└─────────────┬─────────────┘                │                              │
+              │ HTTP                         │                              │
+              ▼                              ▼                              │
+┌─────────────┬──────────────────────────────┬───────────────┐              │
+│               FastAPI Server · src/server.py               │              │
+│                                                            │              │
+│  REST API   POST /say · GET /voices · GET /status/{id}     │              │
+│             GET /health                                    │              │
+│      │                                                     │              │
+│      ▼                                                     │              │
+│  work queue ───▶ audio worker thread (lookahead)           │              │
+└─────────────────────────────────────────────────┬──────────┘              │
+                                                  │                         │
+                                                  ▼                         ▼
+┌──────────────────────┐            ┌─────────────┬─────────────────────────┬──────────────┐
+│  Apple Silicon GPU   │            │            Shared TTS Engine · src/tts.py            │
+│    Metal via MLX     │            │                                                      │
+│                      │◀── text ───│   streaming generation                               │
+│ Voxtral 4B TTS model │── audio ──▶│             │                                        │
+│ 4-bit / 6-bit / bf16 │            │             ▼                                        │
+│    unified memory    │            │   loudness normalization (pyloudnorm · BS.1770-4)    │
+└──────────────────────┘            │             │                                        │
+                                    │             ├────────────────────────┐               │
+                                    │             ▼                        ▼               │
+                                    │   playback (sounddevice)        WAV writer           │
+                                    └─────────────┬────────────────────────┬───────────────┘
+                                                  │                        │
+                                                  ▼                        ▼
+                                            ┌──────────┐         ┌───────────────────┐
+                                            │ Speakers │         │ data/output/*.wav │
+                                            └──────────┘         └───────────────────┘
 ```
 
 ## Prerequisites
