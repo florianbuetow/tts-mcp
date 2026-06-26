@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Kept audio streams warm between utterances to eliminate cold-start latency.
+
 ### Fixed
 
 - Fixed CLI playback failure on current MLX by loading models inside worker threads.
