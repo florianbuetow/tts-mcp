@@ -21,6 +21,8 @@ from pydantic import BaseModel
 
 from src.tts import (
     OUTPUT_DIR,
+    AudioPlayer,
+    PlaybackJob,
     TTSModel,
     clean_text,
     discover_voices,
@@ -28,7 +30,6 @@ from src.tts import (
     load_config,
     make_output_path,
     normalize_chunks,
-    play_chunks,
     simplify_punctuation,
 )
 
@@ -68,6 +69,7 @@ class ServerState:
         voices: list[str],
         default_voice: str,
         sample_rate: int,
+        lead_silence_ms: int,
         simplify_punctuation: bool,
         save_wav: bool,
         normalize_audio: bool,
@@ -87,6 +89,7 @@ class ServerState:
             voices: Available voice names.
             default_voice: Default voice for requests without voice override.
             sample_rate: Audio sample rate in Hz.
+            lead_silence_ms: Silence written after each audio stream open/reopen.
             simplify_punctuation: Whether to simplify punctuation before TTS.
             save_wav: Whether to save generated audio to WAV files.
             normalize_audio: Whether to apply utterance-level loudness normalization.
@@ -100,6 +103,7 @@ class ServerState:
         self.voices = voices
         self.default_voice = default_voice
         self.sample_rate = sample_rate
+        self.lead_silence_ms = lead_silence_ms
         self.simplify_punctuation = simplify_punctuation
         self.save_wav = save_wav
         self.normalize_audio = normalize_audio
@@ -256,37 +260,6 @@ def status(request: Request, message_id: str) -> StatusResponse:
     )
 
 
-def _finish_playback(
-    state: ServerState,
-    message_id: str,
-    chunks: list[np.ndarray],
-    output_path: Path | None,
-) -> None:
-    """Play audio chunks and update message status to completed or error.
-
-    Args:
-        state: Server state with status dict and lock.
-        message_id: ID of the message being played.
-        chunks: Audio chunks to play.
-        output_path: Path to save the WAV file, or None to skip saving.
-    """
-    try:
-        play_chunks(chunks, output_path, state.sample_rate)
-        with state.status_lock:
-            ms = state.statuses[message_id]
-            ms.status = "completed"
-            ms.audio_file = str(output_path) if output_path is not None else None
-            ms.completed_at = time.time()
-        logger.debug("Playback completed for %s -> %s", message_id, output_path)
-    except Exception as exc:
-        logger.error("Playback failed for %s: %s", message_id, exc)
-        with state.status_lock:
-            ms = state.statuses[message_id]
-            ms.status = "error"
-            ms.error = str(exc)
-            ms.completed_at = time.time()
-
-
 def _fail_item(state: ServerState, message_id: str, error: str) -> None:
     """Mark a work item as failed in the status dict.
 
@@ -305,35 +278,58 @@ def _fail_item(state: ServerState, message_id: str, error: str) -> None:
 
 def _start_playback(
     state: ServerState,
+    player: AudioPlayer,
     pending: tuple[WorkItem, list[np.ndarray]],
-    playback_thread: threading.Thread | None,
-) -> threading.Thread:
-    """Wait for any prior playback, then start a new playback thread.
+    playback_done: threading.Event | None,
+) -> threading.Event:
+    """Wait for any prior playback, then queue a new playback job.
 
     Args:
         state: Server state with status dict and lock.
+        player: Persistent audio player.
         pending: Tuple of (work_item, audio_chunks) ready for playback.
-        playback_thread: Previously running playback thread, or None.
+        playback_done: Completion event for the previous playback, or None.
 
     Returns:
-        Newly started playback thread.
+        Completion event for the newly queued playback.
     """
-    if playback_thread is not None:
-        playback_thread.join()
+    if playback_done is not None:
+        playback_done.wait()
 
     work_item, chunks = pending
+    done = threading.Event()
+
+    def on_complete(output_path: Path | None) -> None:
+        with state.status_lock:
+            ms = state.statuses[work_item.message_id]
+            ms.status = "completed"
+            ms.audio_file = str(output_path) if output_path is not None else None
+            ms.completed_at = time.time()
+        logger.debug("Playback completed for %s -> %s", work_item.message_id, output_path)
+        done.set()
+
+    def on_error(exc: Exception) -> None:
+        logger.error("Playback failed for %s: %s", work_item.message_id, exc)
+        with state.status_lock:
+            ms = state.statuses[work_item.message_id]
+            ms.status = "error"
+            ms.error = str(exc)
+            ms.completed_at = time.time()
+        done.set()
 
     with state.status_lock:
         state.statuses[work_item.message_id].status = "playing"
 
     output_path = make_output_path(OUTPUT_DIR) if state.save_wav else None
-    thread = threading.Thread(
-        target=_finish_playback,
-        args=(state, work_item.message_id, chunks, output_path),
-        daemon=True,
+    player.submit(
+        PlaybackJob(
+            chunks=chunks,
+            output_path=output_path,
+            on_complete=on_complete,
+            on_error=on_error,
+        )
     )
-    thread.start()
-    return thread
+    return done
 
 
 def _load_worker_model(state: ServerState) -> TTSModel | None:
@@ -416,43 +412,48 @@ def server_audio_worker(state: ServerState) -> None:
     if model is None:
         return
 
+    player = AudioPlayer(state.sample_rate, state.lead_silence_ms)
     pending: tuple[WorkItem, list[np.ndarray]] | None = None
-    playback_thread: threading.Thread | None = None
+    playback_done: threading.Event | None = None
 
-    while True:
-        current_item: WorkItem | None = None
-        try:
-            if pending is not None:
-                playback_thread = _start_playback(state, pending, playback_thread)
-                pending = None
+    try:
+        while True:
+            current_item: WorkItem | None = None
+            try:
+                if pending is not None:
+                    playback_done = _start_playback(state, player, pending, playback_done)
+                    pending = None
 
-            item = state.work_queue.get()
-            if item is None:
-                if playback_thread is not None:
-                    playback_thread.join()
-                break
+                item = state.work_queue.get()
+                if item is None:
+                    if playback_done is not None:
+                        playback_done.wait()
+                    break
 
-            current_item = item
+                current_item = item
 
-            chunks = _generate_item(state, model, item)
-            if chunks is not None:
-                pending = (item, chunks)
+                chunks = _generate_item(state, model, item)
+                if chunks is not None:
+                    pending = (item, chunks)
 
-            state.work_queue.task_done()
+                state.work_queue.task_done()
 
-        except Exception as exc:
-            logger.error(
-                "Audio worker caught unexpected error (recovering): %s",
-                exc,
-                exc_info=True,
-            )
-            if current_item is not None:
-                _fail_item(state, current_item.message_id, f"unexpected worker error: {exc}")
-                with contextlib.suppress(ValueError):
-                    state.work_queue.task_done()
+            except Exception as exc:
+                logger.error(
+                    "Audio worker caught unexpected error (recovering): %s",
+                    exc,
+                    exc_info=True,
+                )
+                if current_item is not None:
+                    _fail_item(state, current_item.message_id, f"unexpected worker error: {exc}")
+                    with contextlib.suppress(ValueError):
+                        state.work_queue.task_done()
 
-    if pending is not None:
-        _start_playback(state, pending, playback_thread)
+        if pending is not None:
+            playback_done = _start_playback(state, player, pending, playback_done)
+            playback_done.wait()
+    finally:
+        player.close()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -468,6 +469,7 @@ class _ServerConfig:
     target_lufs: float
     true_peak_ceiling_db: float
     min_duration_seconds: float
+    lead_silence_ms: int
 
 
 def _require(config: dict[str, object], key: str) -> object:
@@ -503,6 +505,7 @@ def _parse_server_config() -> _ServerConfig:
         target_lufs=float(cast(float, _require(config, "target_lufs"))),
         true_peak_ceiling_db=float(cast(float, _require(config, "true_peak_ceiling_db"))),
         min_duration_seconds=float(cast(float, _require(config, "min_duration_seconds"))),
+        lead_silence_ms=int(cast(int, _require(config, "lead_silence_ms"))),
     )
 
 
@@ -524,6 +527,7 @@ def _build_server_state(cfg: _ServerConfig) -> ServerState:
         voices=available_voices,
         default_voice=cfg.default_voice,
         sample_rate=cfg.sample_rate,
+        lead_silence_ms=cfg.lead_silence_ms,
         simplify_punctuation=cfg.simplify_punctuation,
         save_wav=cfg.save_wav,
         normalize_audio=cfg.normalize_audio,

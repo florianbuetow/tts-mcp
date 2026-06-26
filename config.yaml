@@ -1,6 +1,7 @@
 model: ./data/models/Voxtral-4B-TTS-2603-mlx-6bit
 models_dir: ./data/models
 sample_rate: 24000
+lead_silence_ms: 200
 default_voice: de_male
 save_wav: true
 simplify_punctuation: false

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pyloudnorm as pyln
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -19,6 +20,7 @@ from src.server import (
     router,
     server_audio_worker,
 )
+from src.tts import AudioPlayer
 
 
 def _make_state(
@@ -27,6 +29,7 @@ def _make_state(
     sample_rate: int = 24000,
     simplify_punctuation: bool = False,
     save_wav: bool = True,
+    lead_silence_ms: int = 200,
     normalize_audio: bool = False,
     target_lufs: float = -20.0,
     true_peak_ceiling_db: float = -1.0,
@@ -52,6 +55,7 @@ def _make_state(
         voices=voices,
         default_voice=default_voice,
         sample_rate=sample_rate,
+        lead_silence_ms=lead_silence_ms,
         simplify_punctuation=simplify_punctuation,
         save_wav=save_wav,
         normalize_audio=normalize_audio,
@@ -68,6 +72,45 @@ def _make_app(state: ServerState) -> FastAPI:
     app.state.server = state
     app.include_router(router)
     return app
+
+
+class _ImmediateAudioPlayer:
+    """Synchronous fake for server worker tests."""
+
+    playback_error: Exception | None = None
+    active_count = 0
+    max_active_count = 0
+
+    def __init__(self, sample_rate: int, lead_silence_ms: int) -> None:
+        self.sample_rate = sample_rate
+        self.lead_silence_ms = lead_silence_ms
+
+    def submit(self, job: Any) -> None:
+        _ImmediateAudioPlayer.active_count += 1
+        _ImmediateAudioPlayer.max_active_count = max(
+            _ImmediateAudioPlayer.max_active_count,
+            _ImmediateAudioPlayer.active_count,
+        )
+        try:
+            if _ImmediateAudioPlayer.playback_error is not None:
+                if job.on_error is not None:
+                    job.on_error(_ImmediateAudioPlayer.playback_error)
+                return
+            if job.on_complete is not None:
+                job.on_complete(job.output_path)
+        finally:
+            _ImmediateAudioPlayer.active_count -= 1
+
+    def close(self) -> None:
+        return
+
+
+@pytest.fixture(autouse=True)
+def _use_immediate_audio_player(monkeypatch: pytest.MonkeyPatch) -> None:
+    _ImmediateAudioPlayer.playback_error = None
+    _ImmediateAudioPlayer.active_count = 0
+    _ImmediateAudioPlayer.max_active_count = 0
+    monkeypatch.setattr("src.server.AudioPlayer", _ImmediateAudioPlayer)
 
 
 class TestHealth:
@@ -432,8 +475,7 @@ class TestEviction:
 class TestServerAudioWorker:
     """Tests for the server audio worker."""
 
-    @patch("src.server.play_chunks")
-    def test_processes_single_message(self, mock_play: MagicMock) -> None:
+    def test_processes_single_message(self) -> None:
         state = _make_state()
         mock_chunk = MagicMock()
         mock_chunk.audio = np.ones(100, dtype=np.float32)
@@ -462,8 +504,7 @@ class TestServerAudioWorker:
             assert state.statuses[msg_id].status == "completed"
             assert state.statuses[msg_id].audio_file is not None
 
-    @patch("src.server.play_chunks")
-    def test_processes_multiple_messages_sequentially(self, mock_play: MagicMock) -> None:
+    def test_processes_multiple_messages_sequentially(self) -> None:
         state = _make_state()
         mock_chunk = MagicMock()
         mock_chunk.audio = np.ones(100, dtype=np.float32)
@@ -494,8 +535,7 @@ class TestServerAudioWorker:
                 msg_id = f"msg_test_{i:03d}"
                 assert state.statuses[msg_id].status == "completed"
 
-    @patch("src.server.play_chunks")
-    def test_handles_generation_error(self, mock_play: MagicMock) -> None:
+    def test_handles_generation_error(self) -> None:
         state = _make_state()
         model = cast(Any, state.model)
         model.generate.side_effect = RuntimeError("Model crashed")
@@ -524,8 +564,7 @@ class TestServerAudioWorker:
             assert error is not None
             assert "Model crashed" in error
 
-    @patch("src.server.play_chunks")
-    def test_shuts_down_on_none_sentinel(self, mock_play: MagicMock) -> None:
+    def test_shuts_down_on_none_sentinel(self) -> None:
         state = _make_state()
         state.work_queue.put(None)
 
@@ -537,14 +576,13 @@ class TestServerAudioWorker:
         model = cast(Any, state.model)
         model.generate.assert_not_called()
 
-    @patch("src.server.play_chunks")
-    def test_handles_playback_error(self, mock_play: MagicMock) -> None:
+    def test_handles_playback_error(self) -> None:
         state = _make_state()
         mock_chunk = MagicMock()
         mock_chunk.audio = np.ones(100, dtype=np.float32)
         model = cast(Any, state.model)
         model.generate.return_value = [mock_chunk]
-        mock_play.side_effect = RuntimeError("Audio device error")
+        _ImmediateAudioPlayer.playback_error = RuntimeError("Audio device error")
 
         msg_id = "msg_play_err"
         with state.status_lock:
@@ -570,9 +608,62 @@ class TestServerAudioWorker:
             assert error is not None
             assert "Audio device error" in error
 
-    @patch("src.server.play_chunks")
+    @patch("src.tts.sd")
+    def test_recovers_after_output_stream_terminates(
+        self,
+        mock_sd: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("src.server.AudioPlayer", AudioPlayer)
+
+        first_stream = MagicMock()
+        second_stream = MagicMock()
+        first_stream.write.side_effect = [None, RuntimeError("output stream terminated")]
+        mock_sd.OutputStream.side_effect = [first_stream, second_stream]
+
+        state = _make_state(save_wav=False, sample_rate=1000, lead_silence_ms=200)
+        mock_chunk = MagicMock()
+        mock_chunk.audio = np.ones(4, dtype=np.float32)
+        model = cast(Any, state.model)
+        model.generate.return_value = [mock_chunk]
+
+        first_msg = "msg_stream_lost"
+        second_msg = "msg_stream_recovered"
+        for message_id, text in [(first_msg, "first"), (second_msg, "second")]:
+            with state.status_lock:
+                state.statuses[message_id] = MessageStatus(
+                    message_id=message_id,
+                    status="queued",
+                    text=text,
+                    audio_file=None,
+                    error=None,
+                    completed_at=None,
+                )
+            state.work_queue.put(WorkItem(message_id=message_id, text=text, voice="casual_female"))
+        state.work_queue.put(None)
+
+        t = threading.Thread(target=server_audio_worker, args=(state,))
+        t.start()
+        t.join(timeout=5)
+
+        assert not t.is_alive()
+        assert mock_sd.OutputStream.call_count == 2
+
+        first_silence = first_stream.write.call_args_list[0].args[0]
+        second_silence = second_stream.write.call_args_list[0].args[0]
+        assert first_silence.shape == (200, 1)
+        assert second_silence.shape == (200, 1)
+        assert float(np.max(np.abs(first_silence))) == 0.0
+        assert float(np.max(np.abs(second_silence))) == 0.0
+
+        with state.status_lock:
+            assert state.statuses[first_msg].status == "error"
+            assert state.statuses[first_msg].error is not None
+            assert "output stream terminated" in state.statuses[first_msg].error
+            assert state.statuses[second_msg].status == "completed"
+
     @patch("src.server.load")
-    def test_loads_model_on_worker_thread_when_not_preloaded(self, mock_load: MagicMock, mock_play: MagicMock) -> None:
+    def test_loads_model_on_worker_thread_when_not_preloaded(self, mock_load: MagicMock) -> None:
         """Regression: the model must be loaded on the same thread that calls
         generate, because MLX GPU streams are thread-local. Loading on the main
         thread and generating on the worker thread raised
@@ -625,9 +716,8 @@ class TestServerAudioWorker:
         with state.status_lock:
             assert state.statuses[msg_id].status == "completed"
 
-    @patch("src.server.play_chunks")
     @patch("src.server.load")
-    def test_reports_model_load_failure_via_ready_queue(self, mock_load: MagicMock, mock_play: MagicMock) -> None:
+    def test_reports_model_load_failure_via_ready_queue(self, mock_load: MagicMock) -> None:
         """A model-load failure on the worker thread is propagated through
         ready_queue so the main thread (lifespan) can surface it on startup.
         """
@@ -645,8 +735,7 @@ class TestServerAudioWorker:
         assert isinstance(result, RuntimeError)
         assert "model load boom" in str(result)
 
-    @patch("src.server.play_chunks")
-    def test_signals_ready_when_model_preloaded(self, mock_play: MagicMock) -> None:
+    def test_signals_ready_when_model_preloaded(self) -> None:
         """When a model is pre-loaded, the worker still signals readiness with
         None so the lifespan startup unblocks.
         """
@@ -664,8 +753,7 @@ class TestServerAudioWorker:
 class TestSaveWavDisabled:
     """Tests for save_wav=False behavior."""
 
-    @patch("src.server.play_chunks")
-    def test_completes_without_audio_file_when_save_wav_disabled(self, mock_play: MagicMock) -> None:
+    def test_completes_without_audio_file_when_save_wav_disabled(self) -> None:
         state = _make_state(save_wav=False)
         mock_chunk = MagicMock()
         mock_chunk.audio = np.ones(100, dtype=np.float32)
@@ -694,16 +782,11 @@ class TestSaveWavDisabled:
             assert state.statuses[msg_id].status == "completed"
             assert state.statuses[msg_id].audio_file is None
 
-        mock_play.assert_called_once()
-        call_args = mock_play.call_args
-        assert call_args[0][1] is None
-
 
 class TestConcurrentSay:
     """Test concurrent /say requests are all accepted and processed sequentially."""
 
-    @patch("src.server.play_chunks")
-    def test_concurrent_requests_all_complete(self, mock_play: MagicMock) -> None:
+    def test_concurrent_requests_all_complete(self) -> None:
         state = _make_state()
         mock_chunk = MagicMock()
         mock_chunk.audio = np.ones(100, dtype=np.float32)
@@ -748,27 +831,7 @@ class TestConcurrentSay:
         # Worker called generate once per message
         assert model.generate.call_count == num_messages
 
-    @patch("src.server.play_chunks")
-    def test_concurrent_requests_no_overlapping_playback(self, mock_play: MagicMock) -> None:
-        playing_count = {"current": 0, "max": 0}
-        lock = threading.Lock()
-
-        original_side_effect = mock_play.side_effect
-
-        def track_playback(*args: Any, **kwargs: Any) -> None:
-            with lock:
-                playing_count["current"] += 1
-                if playing_count["current"] > playing_count["max"]:
-                    playing_count["max"] = playing_count["current"]
-            time.sleep(0.05)  # simulate playback duration
-            with lock:
-                playing_count["current"] -= 1
-            if original_side_effect:
-                return original_side_effect(*args, **kwargs)
-            return None
-
-        mock_play.side_effect = track_playback
-
+    def test_concurrent_requests_no_overlapping_playback(self) -> None:
         state = _make_state()
         mock_chunk = MagicMock()
         mock_chunk.audio = np.ones(100, dtype=np.float32)
@@ -788,7 +851,7 @@ class TestConcurrentSay:
         worker.join(timeout=15)
 
         assert not worker.is_alive()
-        assert playing_count["max"] == 1, f"Max concurrent playback was {playing_count['max']}, expected 1"
+        assert _ImmediateAudioPlayer.max_active_count == 1
 
 
 class TestTextPipelineIntegration:

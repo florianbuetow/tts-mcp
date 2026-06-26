@@ -247,11 +247,11 @@ def shutdown_worker(work_queue: queue.Queue[str | None], worker: threading.Threa
     worker.join()
 
 
-def load_cli_config() -> tuple[int, bool, bool, NormalizationSettings]:
+def load_cli_config() -> tuple[int, bool, bool, int, NormalizationSettings]:
     """Load CLI-relevant settings from config.yaml.
 
     Returns:
-        Tuple of (sample_rate, save_wav, simplify_punctuation, normalization).
+        Tuple of (sample_rate, save_wav, simplify_punctuation, lead_silence_ms, normalization).
 
     Raises:
         ValueError: If required keys are missing from config.yaml.
@@ -288,6 +288,11 @@ def load_cli_config() -> tuple[int, bool, bool, NormalizationSettings]:
         msg = "Missing required key 'min_duration_seconds' in config.yaml"
         raise ValueError(msg)
 
+    raw_lead_silence = config.get("lead_silence_ms")
+    if raw_lead_silence is None:
+        msg = "Missing required key 'lead_silence_ms' in config.yaml"
+        raise ValueError(msg)
+
     normalization = NormalizationSettings(
         enabled=bool(raw_normalize),
         target_lufs=float(raw_target_lufs),
@@ -295,7 +300,7 @@ def load_cli_config() -> tuple[int, bool, bool, NormalizationSettings]:
         min_duration_seconds=float(raw_min_duration),
     )
 
-    return int(raw_rate), bool(raw_save_wav), bool(config.get("simplify_punctuation")), normalization
+    return int(raw_rate), bool(raw_save_wav), bool(config.get("simplify_punctuation")), int(raw_lead_silence), normalization
 
 
 def main() -> None:
@@ -307,7 +312,7 @@ def main() -> None:
         list_outputs(OUTPUT_DIR)
         return
 
-    sample_rate, save_wav, simplify_punct, normalization = load_cli_config()
+    sample_rate, save_wav, simplify_punct, lead_silence_ms, normalization = load_cli_config()
 
     model_dir = resolve_model_dir(args.model)
     available_voices = discover_voices(Path(model_dir))
@@ -334,6 +339,7 @@ def main() -> None:
             voice,
             output_path,
             sample_rate,
+            lead_silence_ms,
             normalization.enabled,
             normalization.target_lufs,
             normalization.true_peak_ceiling_db,

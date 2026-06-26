@@ -7,8 +7,45 @@ import pytest
 from src.main import (
     create_argument_parser,
     list_outputs,
+    load_cli_config,
     resolve_model_dir,
 )
+
+
+def _base_cli_config() -> dict[str, object]:
+    return {
+        "sample_rate": 24000,
+        "save_wav": True,
+        "simplify_punctuation": False,
+        "normalize_audio": True,
+        "target_lufs": -10.0,
+        "true_peak_ceiling_db": -1.0,
+        "min_duration_seconds": 0.5,
+        "lead_silence_ms": 200,
+    }
+
+
+class TestLoadCliConfig:
+    """Tests for CLI config parsing."""
+
+    def test_loads_lead_silence_ms(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("src.main.load_config", _base_cli_config)
+
+        sample_rate, save_wav, simplify_punctuation, lead_silence_ms, normalization = load_cli_config()
+
+        assert sample_rate == 24000
+        assert save_wav is True
+        assert simplify_punctuation is False
+        assert lead_silence_ms == 200
+        assert normalization.enabled is True
+
+    def test_raises_when_lead_silence_ms_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = _base_cli_config()
+        del config["lead_silence_ms"]
+        monkeypatch.setattr("src.main.load_config", lambda: config)
+
+        with pytest.raises(ValueError, match="lead_silence_ms"):
+            load_cli_config()
 
 
 class TestResolveModelDir:

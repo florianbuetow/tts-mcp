@@ -11,6 +11,8 @@ import pytest
 from scipy.signal import resample_poly
 
 from src.tts import (
+    AudioPlayer,
+    PlaybackJob,
     audio_worker,
     clean_text,
     discover_models,
@@ -35,9 +37,9 @@ def _worker_args(
     model: MagicMock,
     voice: str,
     output_path: Path | None,
-) -> tuple[queue.Queue[str | None], MagicMock, str, Path | None, int, bool, float, float, float, pyln.Meter]:
+) -> tuple[queue.Queue[str | None], MagicMock, str, Path | None, int, int, bool, float, float, float, pyln.Meter]:
     """Build the positional args tuple for audio_worker with normalization disabled."""
-    return (work_queue, model, voice, output_path, _SR, False, -20.0, -1.0, 0.5, _TEST_METER)
+    return (work_queue, model, voice, output_path, _SR, 200, False, -20.0, -1.0, 0.5, _TEST_METER)
 
 
 def _make_sine(duration_s: float, freq_hz: float, amplitude: float, sample_rate: int = _SR) -> np.ndarray:
@@ -250,9 +252,12 @@ class TestPlayChunks:
         chunks = [np.ones(100, dtype=np.float32), np.ones(200, dtype=np.float32)]
         output_path = tmp_path / "out.wav"
 
-        play_chunks(chunks, output_path, sample_rate=24000)
+        play_chunks(chunks, output_path, sample_rate=24000, lead_silence_ms=200)
 
-        assert mock_stream.write.call_count == 2
+        assert mock_stream.write.call_count == 3
+        silence = mock_stream.write.call_args_list[0].args[0]
+        assert silence.shape == (4800, 1)
+        assert float(np.max(np.abs(silence))) == 0.0
         assert output_path.exists()
 
     @patch("src.tts.sd")
@@ -263,20 +268,90 @@ class TestPlayChunks:
 
         chunks = [np.ones(100, dtype=np.float32), np.ones(200, dtype=np.float32)]
 
-        play_chunks(chunks, None, sample_rate=24000)
+        play_chunks(chunks, None, sample_rate=24000, lead_silence_ms=0)
 
         assert mock_stream.write.call_count == 2
+
+
+class TestAudioPlayer:
+    """Tests for the persistent AudioPlayer."""
+
+    @patch("src.tts.sd")
+    def test_writes_lead_silence_once_for_reused_stream(self, mock_sd: MagicMock) -> None:
+        mock_stream = MagicMock()
+        mock_sd.OutputStream.return_value = mock_stream
+        player = AudioPlayer(sample_rate=1000, lead_silence_ms=200)
+
+        player.submit(PlaybackJob(chunks=[np.ones(3, dtype=np.float32)], output_path=None))
+        player.submit(PlaybackJob(chunks=[np.ones(4, dtype=np.float32)], output_path=None))
+        player.close()
+
+        mock_sd.OutputStream.assert_called_once_with(samplerate=1000, channels=1, dtype="float32")
+        assert mock_stream.start.call_count == 1
+        assert mock_stream.write.call_count == 3
+        silence = mock_stream.write.call_args_list[0].args[0]
+        assert silence.shape == (200, 1)
+        assert float(np.max(np.abs(silence))) == 0.0
+
+    @patch("src.tts.sd")
+    def test_reopens_and_rewarms_after_stream_write_error(self, mock_sd: MagicMock) -> None:
+        first_stream = MagicMock()
+        second_stream = MagicMock()
+        first_stream.write.side_effect = [None, RuntimeError("device lost")]
+        mock_sd.OutputStream.side_effect = [first_stream, second_stream]
+
+        errors: list[Exception] = []
+        completed: list[Path | None] = []
+        player = AudioPlayer(sample_rate=1000, lead_silence_ms=200)
+
+        player.submit(
+            PlaybackJob(
+                chunks=[np.ones(3, dtype=np.float32)],
+                output_path=None,
+                on_error=errors.append,
+            )
+        )
+        player.submit(
+            PlaybackJob(
+                chunks=[np.ones(4, dtype=np.float32)],
+                output_path=None,
+                on_complete=completed.append,
+            )
+        )
+        player.close()
+
+        assert mock_sd.OutputStream.call_count == 2
+        assert len(errors) == 1
+        assert "device lost" in str(errors[0])
+        assert completed == [None]
+        first_silence = first_stream.write.call_args_list[0].args[0]
+        second_silence = second_stream.write.call_args_list[0].args[0]
+        assert first_silence.shape == (200, 1)
+        assert second_silence.shape == (200, 1)
+
+    @patch("src.tts.sd")
+    def test_close_raises_unhandled_playback_error(self, mock_sd: MagicMock) -> None:
+        mock_stream = MagicMock()
+        mock_stream.write.side_effect = [None, RuntimeError("device lost")]
+        mock_sd.OutputStream.return_value = mock_stream
+        player = AudioPlayer(sample_rate=1000, lead_silence_ms=200)
+
+        player.submit(PlaybackJob(chunks=[np.ones(3, dtype=np.float32)], output_path=None))
+
+        with pytest.raises(RuntimeError, match="device lost"):
+            player.close()
 
 
 class TestAudioWorker:
     """Tests for the audio_worker function."""
 
-    @patch("src.tts.play_chunks")
-    def test_processes_text_and_signals_done(self, mock_play: MagicMock, tmp_path: Path) -> None:
+    @patch("src.tts.sd")
+    def test_processes_text_and_signals_done(self, mock_sd: MagicMock, tmp_path: Path) -> None:
         mock_model = MagicMock()
         chunk = MagicMock()
         chunk.audio = np.ones(100, dtype=np.float32)
         mock_model.generate.return_value = [chunk]
+        mock_sd.OutputStream.return_value = MagicMock()
 
         work_queue: queue.Queue[str | None] = queue.Queue()
         work_queue.put("hello world")
@@ -292,12 +367,13 @@ class TestAudioWorker:
         assert not t.is_alive()
         mock_model.generate.assert_called_once_with(text="hello world", voice="casual_female")
 
-    @patch("src.tts.play_chunks")
-    def test_processes_multiple_items(self, mock_play: MagicMock, tmp_path: Path) -> None:
+    @patch("src.tts.sd")
+    def test_processes_multiple_items(self, mock_sd: MagicMock, tmp_path: Path) -> None:
         mock_model = MagicMock()
         chunk = MagicMock()
         chunk.audio = np.ones(100, dtype=np.float32)
         mock_model.generate.return_value = [chunk]
+        mock_sd.OutputStream.return_value = MagicMock()
 
         work_queue: queue.Queue[str | None] = queue.Queue()
         work_queue.put("first")
@@ -314,8 +390,8 @@ class TestAudioWorker:
         assert not t.is_alive()
         assert mock_model.generate.call_count == 2
 
-    @patch("src.tts.play_chunks")
-    def test_shuts_down_on_none_sentinel(self, mock_play: MagicMock, tmp_path: Path) -> None:
+    @patch("src.tts.sd")
+    def test_shuts_down_on_none_sentinel(self, mock_sd: MagicMock, tmp_path: Path) -> None:
         mock_model = MagicMock()
 
         work_queue: queue.Queue[str | None] = queue.Queue()
@@ -330,13 +406,16 @@ class TestAudioWorker:
 
         assert not t.is_alive()
         mock_model.generate.assert_not_called()
+        mock_sd.OutputStream.assert_not_called()
 
-    @patch("src.tts.play_chunks")
-    def test_processes_text_with_no_save(self, mock_play: MagicMock) -> None:
+    @patch("src.tts.sd")
+    def test_processes_text_with_no_save(self, mock_sd: MagicMock) -> None:
         mock_model = MagicMock()
         chunk = MagicMock()
         chunk.audio = np.ones(100, dtype=np.float32)
         mock_model.generate.return_value = [chunk]
+        mock_stream = MagicMock()
+        mock_sd.OutputStream.return_value = mock_stream
 
         work_queue: queue.Queue[str | None] = queue.Queue()
         work_queue.put("hello world")
@@ -351,9 +430,7 @@ class TestAudioWorker:
 
         assert not t.is_alive()
         mock_model.generate.assert_called_once_with(text="hello world", voice="casual_female")
-        mock_play.assert_called_once()
-        call_args = mock_play.call_args
-        assert call_args[0][1] is None
+        assert mock_stream.write.call_count == 2
 
 
 class TestMakeOutputPath:

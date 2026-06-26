@@ -1,5 +1,6 @@
 """Shared TTS engine: config, model/voice discovery, audio generation, playback, and saving."""
 
+import dataclasses
 import datetime
 import math
 import queue
@@ -7,7 +8,7 @@ import re
 import sys
 import threading
 import wave
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -36,6 +37,26 @@ class TTSModel(Protocol):
 
     def generate(self, text: str, voice: str) -> Iterator[GenerationResult]:
         """Generate speech audio chunks from text."""
+        ...
+
+
+class AudioOutputStream(Protocol):
+    """Runtime methods used from sounddevice.OutputStream."""
+
+    def start(self) -> object:
+        """Start the stream."""
+        ...
+
+    def stop(self) -> object:
+        """Stop the stream."""
+        ...
+
+    def close(self) -> object:
+        """Close the stream."""
+        ...
+
+    def write(self, data: np.ndarray) -> object:
+        """Write audio frames to the stream."""
         ...
 
 
@@ -220,6 +241,136 @@ def save_audio(audio: np.ndarray, output_path: Path, sample_rate: int) -> None:
         wf.writeframes(audio_int16.tobytes())
 
 
+def _write_lead_silence(stream: AudioOutputStream, sample_rate: int, lead_silence_ms: int) -> None:
+    if lead_silence_ms < 0:
+        msg = f"lead_silence_ms must be >= 0, got {lead_silence_ms}"
+        raise ValueError(msg)
+
+    silence_frames = int(sample_rate * lead_silence_ms / 1000)
+    if silence_frames == 0:
+        return
+
+    stream.write(np.zeros((silence_frames, 1), dtype=np.float32))
+
+
+@dataclasses.dataclass(frozen=True)
+class PlaybackJob:
+    """One playback request for the persistent audio player."""
+
+    chunks: list[np.ndarray]
+    output_path: Path | None
+    on_complete: Callable[[Path | None], None] | None = None
+    on_error: Callable[[Exception], None] | None = None
+
+
+class AudioPlayer:
+    """Persistent output stream that warms each physical stream open once."""
+
+    def __init__(self, sample_rate: int, lead_silence_ms: int) -> None:
+        """Initialize the persistent audio player.
+
+        Args:
+            sample_rate: Audio sample rate in Hz.
+            lead_silence_ms: Silence written after each stream open/reopen.
+
+        Raises:
+            ValueError: If lead_silence_ms is negative.
+        """
+        if lead_silence_ms < 0:
+            msg = f"lead_silence_ms must be >= 0, got {lead_silence_ms}"
+            raise ValueError(msg)
+
+        self._sample_rate = sample_rate
+        self._lead_silence_ms = lead_silence_ms
+        self._jobs: queue.Queue[PlaybackJob | None] = queue.Queue()
+        self._unhandled_errors: queue.Queue[Exception] = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._closed = False
+
+    def submit(self, job: PlaybackJob) -> None:
+        """Queue a playback job for serial playback."""
+        if self._closed:
+            msg = "AudioPlayer is closed"
+            raise RuntimeError(msg)
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        self._jobs.put(job)
+
+    def close(self) -> None:
+        """Drain queued playback and close the persistent stream."""
+        self._closed = True
+        if self._thread is None:
+            return
+
+        self._jobs.join()
+        self._jobs.put(None)
+        self._thread.join()
+        self._thread = None
+        if not self._unhandled_errors.empty():
+            raise self._unhandled_errors.get()
+
+    def _open_stream(self) -> AudioOutputStream:
+        stream = cast(AudioOutputStream, sd.OutputStream(samplerate=self._sample_rate, channels=1, dtype="float32"))
+        stream.start()
+        _write_lead_silence(stream, self._sample_rate, self._lead_silence_ms)
+        return stream
+
+    def _close_stream(self, stream: AudioOutputStream | None) -> None:
+        if stream is None:
+            return
+        try:
+            stream.stop()
+        finally:
+            stream.close()
+
+    def _handle_job(self, stream: AudioOutputStream | None, job: PlaybackJob) -> AudioOutputStream | None:
+        try:
+            if stream is None:
+                stream = self._open_stream()
+            for chunk in job.chunks:
+                stream.write(chunk.reshape(-1, 1))
+            if job.output_path is not None:
+                audio = np.concatenate(job.chunks)
+                save_audio(audio, job.output_path, self._sample_rate)
+            if job.on_complete is not None:
+                job.on_complete(job.output_path)
+            return stream
+        except Exception as exc:
+            close_error: Exception | None = None
+            try:
+                self._close_stream(stream)
+            except Exception as stream_close_error:
+                close_error = stream_close_error
+
+            playback_error = exc
+            if close_error is not None:
+                playback_error = RuntimeError(f"{exc}; additionally failed to close audio stream: {close_error}")
+
+            if job.on_error is not None:
+                job.on_error(playback_error)
+            else:
+                self._unhandled_errors.put(playback_error)
+            return None
+
+    def _run(self) -> None:
+        stream: AudioOutputStream | None = None
+        try:
+            while True:
+                job = self._jobs.get()
+                try:
+                    if job is None:
+                        break
+                    stream = self._handle_job(stream, job)
+                finally:
+                    self._jobs.task_done()
+        finally:
+            try:
+                self._close_stream(stream)
+            except Exception as exc:
+                self._unhandled_errors.put(exc)
+
+
 def generate_chunks(model: TTSModel, text: str, voice: str) -> list[np.ndarray]:
     """Generate audio chunks from text without playing.
 
@@ -307,21 +458,74 @@ def normalize_chunks(
     return [part.astype(np.float32, copy=False) for part in out]
 
 
-def play_chunks(chunks: list[np.ndarray], output_path: Path | None, sample_rate: int) -> None:
+def play_chunks(chunks: list[np.ndarray], output_path: Path | None, sample_rate: int, lead_silence_ms: int) -> None:
     """Stream audio chunks to speakers and optionally save to file.
 
     Args:
         chunks: List of audio chunks as numpy arrays.
         output_path: Path to save the generated WAV file, or None to skip saving.
         sample_rate: Sample rate in Hz.
+        lead_silence_ms: Silence written after opening the output stream.
     """
     with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32") as stream:
+        audio_stream = cast(AudioOutputStream, stream)
+        _write_lead_silence(audio_stream, sample_rate, lead_silence_ms)
         for chunk in chunks:
-            stream.write(chunk.reshape(-1, 1))
+            audio_stream.write(chunk.reshape(-1, 1))
 
     if output_path is not None:
         audio = np.concatenate(chunks)
         save_audio(audio, output_path, sample_rate)
+
+
+def _generate_worker_chunks(
+    model: TTSModel,
+    text: str,
+    voice: str,
+    sample_rate: int,
+    normalize_audio: bool,
+    target_lufs: float,
+    true_peak_ceiling_db: float,
+    min_duration_seconds: float,
+    meter: pyln.Meter,
+) -> list[np.ndarray] | None:
+    try:
+        generated = generate_chunks(model, text, voice)
+        if normalize_audio and generated:
+            generated = normalize_chunks(
+                generated,
+                sample_rate,
+                target_lufs,
+                true_peak_ceiling_db,
+                min_duration_seconds,
+                meter,
+            )
+        return generated
+    except (RuntimeError, ValueError) as exc:
+        print(f"\n  Error: {exc}", file=sys.stderr)
+        return None
+
+
+def _submit_worker_playback(
+    player: AudioPlayer,
+    chunks: list[np.ndarray],
+    output_path: Path | None,
+) -> threading.Event:
+    done = threading.Event()
+
+    def on_error(exc: Exception) -> None:
+        print(f"\n  Error: {exc}", file=sys.stderr)
+        done.set()
+
+    player.submit(
+        PlaybackJob(
+            chunks=chunks,
+            output_path=output_path,
+            on_complete=lambda _path: done.set(),
+            on_error=on_error,
+        )
+    )
+    return done
 
 
 def audio_worker(
@@ -330,6 +534,7 @@ def audio_worker(
     voice: str,
     output_path: Path | None,
     sample_rate: int,
+    lead_silence_ms: int,
     normalize_audio: bool,
     target_lufs: float,
     true_peak_ceiling_db: float,
@@ -347,6 +552,7 @@ def audio_worker(
         voice: Voice to use for synthesis.
         output_path: Path to save generated audio, or None to skip saving.
         sample_rate: Sample rate in Hz.
+        lead_silence_ms: Silence written after each audio stream open/reopen.
         normalize_audio: Whether to apply boost-only LUFS normalization.
         target_lufs: Target integrated loudness in LUFS when normalization is enabled.
         true_peak_ceiling_db: Maximum true-peak level in dBFS after gain.
@@ -354,47 +560,46 @@ def audio_worker(
         meter: Pre-constructed pyloudnorm Meter matching sample_rate.
     """
     pending_chunks: list[np.ndarray] | None = None
-    playback_thread: threading.Thread | None = None
+    playback_done: threading.Event | None = None
+    player = AudioPlayer(sample_rate, lead_silence_ms)
 
-    while True:
-        if pending_chunks is not None:
-            if playback_thread is not None:
-                playback_thread.join()
-            chunks_to_play = pending_chunks
-            pending_chunks = None
-            playback_thread = threading.Thread(
-                target=play_chunks,
-                args=(chunks_to_play, output_path, sample_rate),
-                daemon=True,
+    try:
+        while True:
+            if pending_chunks is not None:
+                if playback_done is not None:
+                    playback_done.wait()
+                chunks_to_play = pending_chunks
+                pending_chunks = None
+                playback_done = _submit_worker_playback(player, chunks_to_play, output_path)
+
+            text = work_queue.get()
+            if text is None:
+                if playback_done is not None:
+                    playback_done.wait()
+                break
+
+            generated = _generate_worker_chunks(
+                model,
+                text,
+                voice,
+                sample_rate,
+                normalize_audio,
+                target_lufs,
+                true_peak_ceiling_db,
+                min_duration_seconds,
+                meter,
             )
-            playback_thread.start()
+            if generated is not None:
+                pending_chunks = generated
+            work_queue.task_done()
 
-        text = work_queue.get()
-        if text is None:
-            if playback_thread is not None:
-                playback_thread.join()
-            break
-
-        try:
-            generated = generate_chunks(model, text, voice)
-            if normalize_audio and generated:
-                generated = normalize_chunks(
-                    generated,
-                    sample_rate,
-                    target_lufs,
-                    true_peak_ceiling_db,
-                    min_duration_seconds,
-                    meter,
-                )
-            pending_chunks = generated
-        except (RuntimeError, ValueError) as exc:
-            print(f"\n  Error: {exc}", file=sys.stderr)
-        work_queue.task_done()
-
-    if pending_chunks is not None:
-        if playback_thread is not None:
-            playback_thread.join()
-        play_chunks(pending_chunks, output_path, sample_rate)
+        if pending_chunks is not None:
+            if playback_done is not None:
+                playback_done.wait()
+            playback_done = _submit_worker_playback(player, pending_chunks, output_path)
+            playback_done.wait()
+    finally:
+        player.close()
 
 
 def audio_worker_from_model_id(
@@ -403,6 +608,7 @@ def audio_worker_from_model_id(
     voice: str,
     output_path: Path | None,
     sample_rate: int,
+    lead_silence_ms: int,
     normalize_audio: bool,
     target_lufs: float,
     true_peak_ceiling_db: float,
@@ -435,6 +641,7 @@ def audio_worker_from_model_id(
         voice,
         output_path,
         sample_rate,
+        lead_silence_ms,
         normalize_audio,
         target_lufs,
         true_peak_ceiling_db,
