@@ -3,11 +3,11 @@ models_dir: ./data/models
 sample_rate: 24000
 lead_silence_ms: 200
 default_voice: de_male
-save_wav: true
+save_wav: false
 simplify_punctuation: false
 normalize_audio: true
 target_lufs: -10.0
 true_peak_ceiling_db: -1.0
 min_duration_seconds: 0.5
 host: 0.0.0.0
-port: 12000
+port: 12001
