@@ -75,6 +75,7 @@ data/models/
 
 # Claude Code
 .claude/
+.codex/
 
 # Beads issue tracker
 .beads/
